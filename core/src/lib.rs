@@ -715,6 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn test_scalar_map_nan_payloads() {
+        // Any NaN should match a NaN map entry, regardless of payload bits.
+        let entries = vec![MapEntry {
+            src: f64::NAN,
+            tgt: 42_u8,
+        }];
+        let c = cfg(&entries, RoundingMode::NearestEven, None);
+
+        // Standard NaN
+        assert_eq!(convert_element(f64::NAN, &c).unwrap(), 42_u8);
+
+        // NaN with custom payload (different bit pattern, still NaN)
+        let nan_payload = f64::from_bits(0x7FF8_0000_0000_0001);
+        assert!(nan_payload.is_nan());
+        assert_eq!(convert_element(nan_payload, &c).unwrap(), 42_u8);
+
+        // Negative NaN (sign bit set)
+        let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+        assert!(neg_nan.is_nan());
+        assert_eq!(convert_element(neg_nan, &c).unwrap(), 42_u8);
+
+        // Signaling NaN (quiet bit clear, payload nonzero)
+        let snan = f64::from_bits(0x7FF0_0000_0000_0001);
+        assert!(snan.is_nan());
+        assert_eq!(convert_element(snan, &c).unwrap(), 42_u8);
+    }
+
+    #[test]
     fn test_scalar_map_exact() {
         let entries = vec![MapEntry {
             src: 42.0_f64,
