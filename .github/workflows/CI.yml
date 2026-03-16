@@ -48,11 +48,12 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
+          working-directory: python
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-linux-${{ matrix.platform.target }}
-          path: dist
+          path: python/dist
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
@@ -79,11 +80,12 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
+          working-directory: python
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
-          path: dist
+          path: python/dist
 
   windows:
     runs-on: ${{ matrix.platform.runner }}
@@ -111,11 +113,12 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          working-directory: python
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-windows-${{ matrix.platform.target }}
-          path: dist
+          path: python/dist
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -137,11 +140,12 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          working-directory: python
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-macos-${{ matrix.platform.target }}
-          path: dist
+          path: python/dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -152,11 +156,12 @@ jobs:
         with:
           command: sdist
           args: --out dist
+          working-directory: python
       - name: Upload sdist
         uses: actions/upload-artifact@v5
         with:
           name: wheels-sdist
-          path: dist
+          path: python/dist
 
   release:
     name: Release
@@ -181,6 +186,6 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Publish to PyPI
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: uv publish 'wheels-*/*'
+        run: uv publish wheels-*/*
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
