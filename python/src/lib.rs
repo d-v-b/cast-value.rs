@@ -16,15 +16,17 @@ use zarr_cast_value_core::{
 // ---------------------------------------------------------------------------
 
 fn parse_rounding(s: &str) -> PyResult<RoundingMode> {
-    RoundingMode::from_str(s).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))
+    s.parse::<RoundingMode>()
+        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
 }
 
 fn parse_out_of_range(s: Option<&str>) -> PyResult<Option<OutOfRangeMode>> {
     match s {
         None => Ok(None),
-        Some(s) => OutOfRangeMode::from_str(s)
+        Some(s) => s
+            .parse::<OutOfRangeMode>()
             .map(Some)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e)),
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>),
     }
 }
 
@@ -424,9 +426,9 @@ fn dispatch_alloc<'py>(
                 "uint64" => int_to_int!($src_ty, u64),
                 "float32" => int_to_float!($src_ty, f32),
                 "float64" => int_to_float!($src_ty, f64),
-                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {tgt_dtype}"),
-                )),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "Unsupported target dtype: {tgt_dtype}"
+                ))),
             }
         };
     }
@@ -444,9 +446,9 @@ fn dispatch_alloc<'py>(
                 "uint64" => float_to_int!($src_ty, u64),
                 "float32" => float_to_float!($src_ty, f32),
                 "float64" => float_to_float!($src_ty, f64),
-                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {tgt_dtype}"),
-                )),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "Unsupported target dtype: {tgt_dtype}"
+                ))),
             }
         };
     }
@@ -462,9 +464,9 @@ fn dispatch_alloc<'py>(
         "uint64" => dispatch_int_src!(u64),
         "float32" => dispatch_float_src!(f32),
         "float64" => dispatch_float_src!(f64),
-        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            format!("Unsupported source dtype: {src_dtype}"),
-        )),
+        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "Unsupported source dtype: {src_dtype}"
+        ))),
     }
 }
 
@@ -472,6 +474,7 @@ fn dispatch_alloc<'py>(
 // N×N dispatch: into variant
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_into<'py>(
     py: Python<'py>,
     arr: &Bound<'py, pyo3::types::PyAny>,
@@ -516,9 +519,9 @@ fn dispatch_into<'py>(
                 "uint64" => int_to_int!($src_ty, u64),
                 "float32" => int_to_float!($src_ty, f32),
                 "float64" => int_to_float!($src_ty, f64),
-                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {tgt_dtype}"),
-                )),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "Unsupported target dtype: {tgt_dtype}"
+                ))),
             }
         };
     }
@@ -536,9 +539,9 @@ fn dispatch_into<'py>(
                 "uint64" => float_to_int!($src_ty, u64),
                 "float32" => float_to_float!($src_ty, f32),
                 "float64" => float_to_float!($src_ty, f64),
-                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {tgt_dtype}"),
-                )),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                    "Unsupported target dtype: {tgt_dtype}"
+                ))),
             }
         };
     }
@@ -554,9 +557,9 @@ fn dispatch_into<'py>(
         "uint64" => dispatch_int_src!(u64),
         "float32" => dispatch_float_src!(f32),
         "float64" => dispatch_float_src!(f64),
-        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            format!("Unsupported source dtype: {src_dtype}"),
-        )),
+        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "Unsupported source dtype: {src_dtype}"
+        ))),
     }
 }
 

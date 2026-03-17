@@ -41,7 +41,8 @@ zarr-cast-value/
 
 Pure Rust. No PyO3, no numpy crate, no Python dependency. Contains:
 
-- Layers 1 and 2 (see below): `convert_element`, `convert_slice`
+- Layers 1 and 2 (see below): four per-element conversion functions and
+  four slice conversion functions
 - Type definitions: `RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`
 - Trait definitions: `CastNum`, `CastInt`, `CastFloat`, `CastInto`
 - Trait implementations for built-in numeric types + external types behind
@@ -337,10 +338,6 @@ default implementations for float-only operations, we use **separate traits for
 integer and float types**. This lets the type system enforce which operations
 are valid, eliminating runtime type checks and dead code.
 
-The `num-traits` crate (already a dependency) provides standard numeric trait
-bounds (`NumCast`, `ToPrimitive`, `Float`, `PrimInt`, etc.) that are used where
-appropriate to avoid reimplementing standard numeric operations.
-
 ```rust
 /// Common base for all numeric types that participate in cast_value conversions.
 /// Provides only the operations shared by both integers and floats.
@@ -381,14 +378,6 @@ Key design points:
   integer is a compile error, not a runtime panic. Similarly, the four conversion
   functions use trait bounds to select the right path at compile time instead of
   runtime `IS_FLOAT`/`IS_INTEGER` checks.
-
-- **`num-traits` integration**: The `num-traits` crate provides `Float`,
-  `PrimInt`, `NumCast`, and `ToPrimitive` traits that overlap with our needs.
-  We use `num_traits::Float` for `is_nan()`, `is_infinite()`, `round()`, etc.
-  on float types. Our custom traits (`CastFloat`, `CastInt`) exist primarily
-  to bundle the specific subset of operations needed by the conversion pipeline
-  and to provide the `CastInto` range-bound mechanism, which `num-traits` does
-  not cover.
 
 - **No `to_f64`/`from_f64` on the hot path**: Scalar map comparison uses
   `PartialEq` on `Src` directly. Map entries are typed as `MapEntry<Src, Dst>`
@@ -448,7 +437,7 @@ Rounding operates on the source float value directly (no intermediate type).
 | `towards-zero` | `.trunc()` | Truncate towards zero |
 | `towards-positive` | `.ceil()` | Round towards +∞ |
 | `towards-negative` | `.floor()` | Round towards −∞ |
-| `nearest-away` | `.signum() * (.abs() + 0.5).floor()` | Round half away from zero |
+| `nearest-away` | `.copysign((.abs() + 0.5).floor(), self)` | Round half away from zero |
 
 These methods are available on `f32` and `f64` natively. For `f16` and `bf16`
 (which lack native arithmetic), the value is promoted to `f32` for the rounding
@@ -479,7 +468,7 @@ intermediate representation is needed for the comparison.
 Applied before rounding and range checking. Each entry is a `(source, target)`
 pair stored as `MapEntry<Src, Dst>`. For each element:
 
-1. If `entry.src_is_nan` → match any NaN value
+1. If `entry.src.is_nan()` → match any NaN value (float sources only)
 2. Otherwise → exact equality: `val == entry.src` (in native `Src` type)
 
 On match, the element is replaced with `entry.tgt` (native `Dst` type) and
@@ -532,10 +521,13 @@ typed `MapEntry<Src, Dst>` values:
 /// A parsed scalar map entry, typed on Src and Dst.
 struct MapEntry<Src, Dst> {
     src: Src,
-    src_is_nan: bool,
     tgt: Dst,
 }
 ```
+
+NaN matching is handled implicitly: `apply_scalar_map_float` calls
+`entry.src.is_nan()` to detect NaN entries at lookup time, so no separate
+boolean flag is needed.
 
 Each caller is responsible for constructing `MapEntry` values using their own
 JSON parsing infrastructure. For the Python boundary specifically, this means
@@ -604,9 +596,10 @@ The core crate has no Python dependency, so zarrs can use it directly.
 ### How zarrs would use the core crate
 
 zarrs would depend on `zarr-cast-value-core` and implement the codec adapter
-on their side. The core crate exposes `convert_element`, `convert_slice`, and
-the supporting types (`RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`,
-`CastNum`, `CastInt`, `CastFloat`, `CastInto`).
+on their side. The core crate exposes the four per-element conversion functions,
+the four slice conversion functions, and the supporting types and traits
+(`RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`, `CastNum`,
+`CastInt`, `CastFloat`, `CastInto`, and the four per-path config structs).
 
 A zarrs-side `CastValue` struct would implement `ArrayToArrayCodecTraits`. Its
 `encode`/`decode` methods would:

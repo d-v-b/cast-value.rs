@@ -23,10 +23,7 @@ impl std::fmt::Display for CastError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CastError::NanOrInf { value } => {
-                write!(
-                    f,
-                    "Cannot cast {value} to integer type without scalar_map"
-                )
+                write!(f, "Cannot cast {value} to integer type without scalar_map")
             }
             CastError::OutOfRange { value, lo, hi } => {
                 write!(
@@ -55,8 +52,10 @@ pub enum RoundingMode {
     NearestAway,
 }
 
-impl RoundingMode {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for RoundingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "nearest-even" => Ok(Self::NearestEven),
             "towards-zero" => Ok(Self::TowardsZero),
@@ -79,8 +78,10 @@ pub enum OutOfRangeMode {
     Wrap,
 }
 
-impl OutOfRangeMode {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for OutOfRangeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "clamp" => Ok(Self::Clamp),
             "wrap" => Ok(Self::Wrap),
