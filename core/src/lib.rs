@@ -4,6 +4,8 @@
 //! This crate is independent of Python/PyO3 and can be used by any Rust consumer
 //! (e.g. zarrs, zarr-python bindings).
 
+use std::ops::{Add, Sub};
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -99,61 +101,38 @@ pub struct MapEntry<Src, Dst> {
 }
 
 // ---------------------------------------------------------------------------
-// Conversion configuration
-// ---------------------------------------------------------------------------
-
-/// All parameters needed for a convert_slice call, bundled together.
-pub struct ConvertConfig<'a, Src, Dst> {
-    pub map_entries: &'a [MapEntry<Src, Dst>],
-    pub rounding: RoundingMode,
-    pub out_of_range: Option<OutOfRangeMode>,
-}
-
-// ---------------------------------------------------------------------------
 // Traits
 // ---------------------------------------------------------------------------
 
-/// A numeric type that can participate in cast_value conversions.
-pub trait CastType: Copy + PartialEq + PartialOrd + std::fmt::Debug {
-    /// Whether this is a floating-point type (has NaN/Inf).
-    const IS_FLOAT: bool;
-    /// Whether this is an integer type (needs range checking as target).
-    const IS_INTEGER: bool;
+/// Common base for all numeric types that participate in cast_value conversions.
+/// Provides only the operations shared by both integers and floats.
+pub trait CastNum: Copy + PartialEq + PartialOrd + std::fmt::Debug {
+    /// Convert to f64 for error reporting only (not in the conversion hot path).
+    fn to_f64_lossy(self) -> f64;
+}
 
+/// An integer numeric type (i8..i64, u8..u64).
+/// Marker trait — integers need no special operations beyond `CastNum`.
+pub trait CastInt: CastNum {}
+
+/// A floating-point numeric type (f32, f64).
+/// Carries all float-specific operations: NaN/Inf checks, rounding, and
+/// arithmetic needed for float→int wrap mode.
+pub trait CastFloat: CastNum + Add<Output = Self> + Sub<Output = Self> {
     /// Returns true if the value is NaN.
     fn is_nan(self) -> bool;
     /// Returns true if the value is infinite.
     fn is_infinite(self) -> bool;
-    /// Convert to f64 for error reporting only (not in the conversion hot path).
-    fn to_f64_lossy(self) -> f64;
-
-    /// Euclidean remainder. Only meaningful for float types (used in float→int
-    /// wrap mode). Integer types may panic — the call is guarded by IS_FLOAT.
-    fn rem_euclid(self, _rhs: Self) -> Self {
-        unreachable!("rem_euclid called on integer type")
-    }
-    /// Subtraction in native type. Only meaningful for float types.
-    fn sub(self, _rhs: Self) -> Self {
-        unreachable!("sub called on integer type")
-    }
-    /// Addition in native type. Only meaningful for float types.
-    fn add(self, _rhs: Self) -> Self {
-        unreachable!("add called on integer type")
-    }
-    /// The value 1 in this type. Only meaningful for float types.
-    fn one() -> Self {
-        unreachable!("one called on integer type")
-    }
-}
-
-/// Rounding support. Float types implement actual rounding;
-/// integer types implement this as identity (no-op).
-pub trait CastRound: CastType {
+    /// Round according to the given rounding mode.
     fn round(self, mode: RoundingMode) -> Self;
+    /// Euclidean remainder (used in float→int wrap mode).
+    fn rem_euclid(self, rhs: Self) -> Self;
+    /// The value 1 in this type.
+    fn one() -> Self;
 }
 
 /// Conversion from Src to Dst. Implemented per (Src, Dst) pair.
-pub trait CastInto<Dst: CastType>: CastType {
+pub trait CastInto<Dst: CastNum>: CastNum {
     /// The minimum Dst value, represented in Src's type.
     fn dst_min() -> Self;
     /// The maximum Dst value, represented in Src's type.
@@ -162,13 +141,19 @@ pub trait CastInto<Dst: CastType>: CastType {
     fn cast_into(self) -> Dst;
 }
 
+/// Helper trait for constructing a value from f64 (needed for constructing
+/// MapEntry values from f64 pairs at the Python boundary).
+pub trait FromF64 {
+    fn from_f64(val: f64) -> Self;
+}
+
 // ---------------------------------------------------------------------------
-// convert_element: Layer 1
+// Scalar map lookup
 // ---------------------------------------------------------------------------
 
-/// Apply scalar_map lookup. Returns Some(tgt) on match, None otherwise.
+/// Apply scalar_map lookup for float sources. Returns Some(tgt) on match.
 #[inline]
-fn apply_scalar_map<Src: CastType, Dst: CastType>(
+fn apply_scalar_map_float<Src: CastFloat, Dst: CastNum>(
     val: Src,
     map_entries: &[MapEntry<Src, Dst>],
 ) -> Option<Dst> {
@@ -184,298 +169,353 @@ fn apply_scalar_map<Src: CastType, Dst: CastType>(
     None
 }
 
-/// Convert a single element from Src to Dst, applying the full pipeline:
-/// scalar_map → NaN/Inf check → round → range check → cast.
+/// Apply scalar_map lookup for integer sources. Returns Some(tgt) on match.
+/// Integers can never be NaN, so only exact equality is checked.
 #[inline]
-pub fn convert_element<Src, Dst>(
+fn apply_scalar_map_int<Src: CastInt, Dst: CastNum>(
     val: Src,
-    config: &ConvertConfig<Src, Dst>,
+    map_entries: &[MapEntry<Src, Dst>],
+) -> Option<Dst> {
+    for entry in map_entries {
+        if val == entry.src {
+            return Some(entry.tgt);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Conversion configs (per-path)
+// ---------------------------------------------------------------------------
+
+/// Configuration for float→int conversion.
+pub struct FloatToIntConfig<'a, Src, Dst> {
+    pub map_entries: &'a [MapEntry<Src, Dst>],
+    pub rounding: RoundingMode,
+    pub out_of_range: Option<OutOfRangeMode>,
+}
+
+/// Configuration for int→int conversion.
+pub struct IntToIntConfig<'a, Src, Dst> {
+    pub map_entries: &'a [MapEntry<Src, Dst>],
+    pub out_of_range: Option<OutOfRangeMode>,
+}
+
+/// Configuration for float→float conversion.
+pub struct FloatToFloatConfig<'a, Src, Dst> {
+    pub map_entries: &'a [MapEntry<Src, Dst>],
+}
+
+/// Configuration for int→float conversion.
+pub struct IntToFloatConfig<'a, Src, Dst> {
+    pub map_entries: &'a [MapEntry<Src, Dst>],
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1: Four per-element conversion functions
+// ---------------------------------------------------------------------------
+
+/// Convert a single float element to an integer.
+///
+/// Pipeline: scalar_map → NaN check → round → range check/clamp/wrap → cast.
+#[inline]
+pub fn convert_float_to_int<Src, Dst>(
+    val: Src,
+    config: &FloatToIntConfig<Src, Dst>,
 ) -> Result<Dst, CastError>
 where
-    Src: CastType + CastRound + CastInto<Dst>,
-    Dst: CastType,
+    Src: CastFloat + CastInto<Dst>,
+    Dst: CastInt,
 {
     // Step 1: scalar_map lookup
     if !config.map_entries.is_empty() {
-        if let Some(tgt) = apply_scalar_map(val, config.map_entries) {
+        if let Some(tgt) = apply_scalar_map_float(val, config.map_entries) {
             return Ok(tgt);
         }
     }
 
-    // Step 2: reject NaN for float→int
-    // NaN must be caught here because NaN comparisons are all false,
-    // so NaN would slip through the range check in step 4.
-    // Infinity is handled by the range check — it naturally compares
-    // as > hi or < lo, so clamp/error work correctly. Wrap mode
-    // rejects infinity separately since rem_euclid(Inf) is NaN.
-    if Src::IS_FLOAT && Dst::IS_INTEGER && val.is_nan() {
+    // Step 2: reject NaN (NaN comparisons are all false, would slip through range check)
+    if val.is_nan() {
         return Err(CastError::NanOrInf {
             value: val.to_f64_lossy(),
         });
     }
 
-    // Step 3: round (float→int only)
-    let val = if Src::IS_FLOAT && Dst::IS_INTEGER {
-        val.round(config.rounding)
-    } else {
-        val
-    };
+    // Step 3: round
+    let val = val.round(config.rounding);
 
-    // Step 4: range check (integer targets only)
-    if Dst::IS_INTEGER {
-        let lo = Src::dst_min();
-        let hi = Src::dst_max();
-        match config.out_of_range {
-            Some(OutOfRangeMode::Clamp) => {
-                // Clamp then cast
-                let clamped = if val < lo {
-                    lo
-                } else if val > hi {
-                    hi
-                } else {
-                    val
-                };
-                return Ok(clamped.cast_into());
+    // Step 4: range check + out-of-range handling
+    let lo = Src::dst_min();
+    let hi = Src::dst_max();
+    match config.out_of_range {
+        Some(OutOfRangeMode::Clamp) => {
+            let clamped = if val < lo {
+                lo
+            } else if val > hi {
+                hi
+            } else {
+                val
+            };
+            Ok(clamped.cast_into())
+        }
+        Some(OutOfRangeMode::Wrap) => {
+            // Inf can't be wrapped (rem_euclid(Inf) is NaN)
+            if val.is_infinite() {
+                return Err(CastError::NanOrInf {
+                    value: val.to_f64_lossy(),
+                });
             }
-            Some(OutOfRangeMode::Wrap) => {
-                if Src::IS_FLOAT {
-                    // Float→int wrap: Inf can't be wrapped.
-                    if val.is_infinite() {
-                        return Err(CastError::NanOrInf {
-                            value: val.to_f64_lossy(),
-                        });
-                    }
-                    if val < lo || val > hi {
-                        // The value is an integer-valued float (already rounded).
-                        // Wrap using native float arithmetic — no f64 promotion.
-                        let range = hi.sub(lo).add(Src::one());
-                        let wrapped = val.sub(lo).rem_euclid(range).add(lo);
-                        return Ok(wrapped.cast_into());
-                    }
-                } else if val < lo || val > hi {
-                    // Int→int wrap: Rust's `as` cast truncates to the target
-                    // width, which is exactly modular arithmetic. No f64 needed.
-                    return Ok(val.cast_into());
-                }
+            if val < lo || val > hi {
+                let range = hi - lo + Src::one();
+                let wrapped = (val - lo).rem_euclid(range) + lo;
+                Ok(wrapped.cast_into())
+            } else {
+                Ok(val.cast_into())
             }
-            None => {
-                if val < lo || val > hi {
-                    return Err(CastError::OutOfRange {
-                        value: val.to_f64_lossy(),
-                        lo: lo.to_f64_lossy(),
-                        hi: hi.to_f64_lossy(),
-                    });
-                }
+        }
+        None => {
+            if val < lo || val > hi {
+                Err(CastError::OutOfRange {
+                    value: val.to_f64_lossy(),
+                    lo: lo.to_f64_lossy(),
+                    hi: hi.to_f64_lossy(),
+                })
+            } else {
+                Ok(val.cast_into())
             }
         }
     }
-
-    // Step 5: cast
-    Ok(val.cast_into())
 }
 
-// ---------------------------------------------------------------------------
-// convert_slice: Layer 2
-// ---------------------------------------------------------------------------
-
-/// Convert a single element without scalar_map lookup.
-/// This is the hot path when no map entries are present.
+/// Convert a single integer element to another integer type.
+///
+/// Pipeline: scalar_map → range check/clamp/wrap → cast.
 #[inline]
-fn convert_element_no_map<Src, Dst>(
+pub fn convert_int_to_int<Src, Dst>(
     val: Src,
-    config: &ConvertConfig<Src, Dst>,
+    config: &IntToIntConfig<Src, Dst>,
 ) -> Result<Dst, CastError>
 where
-    Src: CastType + CastRound + CastInto<Dst>,
-    Dst: CastType,
+    Src: CastInt + CastInto<Dst>,
+    Dst: CastInt,
 {
-    // Skip step 1 entirely — go straight to NaN check
-    if Src::IS_FLOAT && Dst::IS_INTEGER && val.is_nan() {
-        return Err(CastError::NanOrInf {
-            value: val.to_f64_lossy(),
-        });
+    // Step 1: scalar_map lookup
+    if !config.map_entries.is_empty() {
+        if let Some(tgt) = apply_scalar_map_int(val, config.map_entries) {
+            return Ok(tgt);
+        }
     }
-    let val = if Src::IS_FLOAT && Dst::IS_INTEGER {
-        val.round(config.rounding)
-    } else {
-        val
-    };
-    if Dst::IS_INTEGER {
-        let lo = Src::dst_min();
-        let hi = Src::dst_max();
-        match config.out_of_range {
-            Some(OutOfRangeMode::Clamp) => {
-                let clamped = if val < lo {
-                    lo
-                } else if val > hi {
-                    hi
-                } else {
-                    val
-                };
-                return Ok(clamped.cast_into());
-            }
-            Some(OutOfRangeMode::Wrap) => {
-                if Src::IS_FLOAT {
-                    if val.is_infinite() {
-                        return Err(CastError::NanOrInf {
-                            value: val.to_f64_lossy(),
-                        });
-                    }
-                    if val < lo || val > hi {
-                        let range = hi.sub(lo).add(Src::one());
-                        let wrapped = val.sub(lo).rem_euclid(range).add(lo);
-                        return Ok(wrapped.cast_into());
-                    }
-                } else if val < lo || val > hi {
-                    return Ok(val.cast_into());
-                }
-            }
-            None => {
-                if val < lo || val > hi {
-                    return Err(CastError::OutOfRange {
-                        value: val.to_f64_lossy(),
-                        lo: lo.to_f64_lossy(),
-                        hi: hi.to_f64_lossy(),
-                    });
-                }
+
+    // Step 2: range check + out-of-range handling
+    let lo = Src::dst_min();
+    let hi = Src::dst_max();
+    match config.out_of_range {
+        Some(OutOfRangeMode::Clamp) => {
+            let clamped = if val < lo {
+                lo
+            } else if val > hi {
+                hi
+            } else {
+                val
+            };
+            Ok(clamped.cast_into())
+        }
+        Some(OutOfRangeMode::Wrap) => {
+            // Int→int wrap: Rust's `as` cast truncates to the target width,
+            // which is exactly modular arithmetic.
+            Ok(val.cast_into())
+        }
+        None => {
+            if val < lo || val > hi {
+                Err(CastError::OutOfRange {
+                    value: val.to_f64_lossy(),
+                    lo: lo.to_f64_lossy(),
+                    hi: hi.to_f64_lossy(),
+                })
+            } else {
+                Ok(val.cast_into())
             }
         }
     }
+}
+
+/// Convert a single float element to another float type.
+///
+/// Pipeline: scalar_map → cast. No rounding or range check needed.
+#[inline]
+pub fn convert_float_to_float<Src, Dst>(
+    val: Src,
+    config: &FloatToFloatConfig<Src, Dst>,
+) -> Result<Dst, CastError>
+where
+    Src: CastFloat + CastInto<Dst>,
+    Dst: CastFloat,
+{
+    // Step 1: scalar_map lookup
+    if !config.map_entries.is_empty() {
+        if let Some(tgt) = apply_scalar_map_float(val, config.map_entries) {
+            return Ok(tgt);
+        }
+    }
+
+    // Step 2: cast
     Ok(val.cast_into())
 }
 
-/// Convert a slice of Src values to Dst values. Returns early on first error.
+/// Convert a single integer element to a float type.
 ///
-/// When no scalar_map entries are present, uses a tighter inner loop that
-/// skips the map lookup entirely, allowing better optimization.
-pub fn convert_slice<Src, Dst>(
+/// Pipeline: scalar_map → cast. No rounding or range check needed.
+#[inline]
+pub fn convert_int_to_float<Src, Dst>(
+    val: Src,
+    config: &IntToFloatConfig<Src, Dst>,
+) -> Result<Dst, CastError>
+where
+    Src: CastInt + CastInto<Dst>,
+    Dst: CastFloat,
+{
+    // Step 1: scalar_map lookup
+    if !config.map_entries.is_empty() {
+        if let Some(tgt) = apply_scalar_map_int(val, config.map_entries) {
+            return Ok(tgt);
+        }
+    }
+
+    // Step 2: cast
+    Ok(val.cast_into())
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2: Four slice conversion functions
+// ---------------------------------------------------------------------------
+
+/// Convert a slice of float values to integer values. Returns early on first error.
+pub fn convert_slice_float_to_int<Src, Dst>(
     src: &[Src],
     dst: &mut [Dst],
-    config: &ConvertConfig<Src, Dst>,
+    config: &FloatToIntConfig<Src, Dst>,
 ) -> Result<(), CastError>
 where
-    Src: CastType + CastRound + CastInto<Dst>,
-    Dst: CastType,
+    Src: CastFloat + CastInto<Dst>,
+    Dst: CastInt,
 {
-    if config.map_entries.is_empty() {
-        // Hot path: no scalar_map — skip map lookup per element
-        for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
-            *out_slot = convert_element_no_map(*in_val, config)?;
-        }
-    } else {
-        // Map path: includes scalar_map lookup per element
-        for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
-            *out_slot = convert_element(*in_val, config)?;
-        }
+    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+        *out_slot = convert_float_to_int(*in_val, config)?;
     }
     Ok(())
 }
 
-/// Helper trait for constructing a value from f64 (needed for float→int wrap
-/// mode and for constructing MapEntry values from f64 pairs at the Python boundary).
-pub trait FromF64 {
-    fn from_f64(val: f64) -> Self;
+/// Convert a slice of integer values to integer values. Returns early on first error.
+pub fn convert_slice_int_to_int<Src, Dst>(
+    src: &[Src],
+    dst: &mut [Dst],
+    config: &IntToIntConfig<Src, Dst>,
+) -> Result<(), CastError>
+where
+    Src: CastInt + CastInto<Dst>,
+    Dst: CastInt,
+{
+    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+        *out_slot = convert_int_to_int(*in_val, config)?;
+    }
+    Ok(())
+}
+
+/// Convert a slice of float values to float values. Returns early on first error.
+pub fn convert_slice_float_to_float<Src, Dst>(
+    src: &[Src],
+    dst: &mut [Dst],
+    config: &FloatToFloatConfig<Src, Dst>,
+) -> Result<(), CastError>
+where
+    Src: CastFloat + CastInto<Dst>,
+    Dst: CastFloat,
+{
+    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+        *out_slot = convert_float_to_float(*in_val, config)?;
+    }
+    Ok(())
+}
+
+/// Convert a slice of integer values to float values. Returns early on first error.
+pub fn convert_slice_int_to_float<Src, Dst>(
+    src: &[Src],
+    dst: &mut [Dst],
+    config: &IntToFloatConfig<Src, Dst>,
+) -> Result<(), CastError>
+where
+    Src: CastInt + CastInto<Dst>,
+    Dst: CastFloat,
+{
+    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+        *out_slot = convert_int_to_float(*in_val, config)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Trait implementations for primitive types
 // ---------------------------------------------------------------------------
 
-// ---- CastType impls ----
+// ---- CastNum impls ----
 
-macro_rules! impl_cast_type_int {
+macro_rules! impl_cast_num {
     ($($ty:ty),*) => {
         $(
-            impl CastType for $ty {
-                const IS_FLOAT: bool = false;
-                const IS_INTEGER: bool = true;
-                #[inline] fn is_nan(self) -> bool { false }
-                #[inline] fn is_infinite(self) -> bool { false }
-                #[inline] fn to_f64_lossy(self) -> f64 { self as f64 }
-            }
-        )*
-    };
-}
-
-impl_cast_type_int!(i8, i16, i32, i64, u8, u16, u32, u64);
-
-macro_rules! impl_cast_type_float {
-    ($($ty:ty),*) => {
-        $(
-            impl CastType for $ty {
-                const IS_FLOAT: bool = true;
-                const IS_INTEGER: bool = false;
-                #[inline] fn is_nan(self) -> bool { <$ty>::is_nan(self) }
-                #[inline] fn is_infinite(self) -> bool { <$ty>::is_infinite(self) }
-                #[inline] fn to_f64_lossy(self) -> f64 { self as f64 }
-                #[inline] fn rem_euclid(self, rhs: Self) -> Self { <$ty>::rem_euclid(self, rhs) }
-                #[inline] fn sub(self, rhs: Self) -> Self { self - rhs }
-                #[inline] fn add(self, rhs: Self) -> Self { self + rhs }
-                #[inline] fn one() -> Self { 1.0 }
-            }
-        )*
-    };
-}
-
-impl_cast_type_float!(f32, f64);
-
-// ---- CastRound impls ----
-
-macro_rules! impl_cast_round_int {
-    ($($ty:ty),*) => {
-        $(
-            impl CastRound for $ty {
+            impl CastNum for $ty {
                 #[inline]
-                fn round(self, _mode: RoundingMode) -> Self { self }
+                fn to_f64_lossy(self) -> f64 { self as f64 }
             }
         )*
     };
 }
 
-impl_cast_round_int!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_cast_num!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
 
-macro_rules! impl_cast_round_float {
+// ---- CastInt impls ----
+
+macro_rules! impl_cast_int {
+    ($($ty:ty),*) => {
+        $( impl CastInt for $ty {} )*
+    };
+}
+
+impl_cast_int!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+// ---- CastFloat impls ----
+
+macro_rules! impl_cast_float {
     ($($ty:ty),*) => {
         $(
-            impl CastRound for $ty {
+            impl CastFloat for $ty {
+                #[inline]
+                fn is_nan(self) -> bool { <$ty>::is_nan(self) }
+                #[inline]
+                fn is_infinite(self) -> bool { <$ty>::is_infinite(self) }
                 #[inline]
                 fn round(self, mode: RoundingMode) -> Self {
                     match mode {
-                        RoundingMode::NearestEven => {
-                            // round_ties_even is available on f32/f64 since Rust 1.77
-                            let v = self as f64;
-                            v.round_ties_even() as $ty
-                        }
-                        RoundingMode::TowardsZero => {
-                            let v = self as f64;
-                            v.trunc() as $ty
-                        }
-                        RoundingMode::TowardsPositive => {
-                            let v = self as f64;
-                            v.ceil() as $ty
-                        }
-                        RoundingMode::TowardsNegative => {
-                            let v = self as f64;
-                            v.floor() as $ty
-                        }
+                        RoundingMode::NearestEven => <$ty>::round_ties_even(self),
+                        RoundingMode::TowardsZero => <$ty>::trunc(self),
+                        RoundingMode::TowardsPositive => <$ty>::ceil(self),
+                        RoundingMode::TowardsNegative => <$ty>::floor(self),
                         RoundingMode::NearestAway => {
-                            let v = self as f64;
-                            (v.signum() * (v.abs() + 0.5).floor()) as $ty
+                            <$ty>::copysign((<$ty>::abs(self) + 0.5).floor(), self)
                         }
                     }
                 }
+                #[inline]
+                fn rem_euclid(self, rhs: Self) -> Self { <$ty>::rem_euclid(self, rhs) }
+                #[inline]
+                fn one() -> Self { 1.0 }
             }
         )*
     };
 }
 
-impl_cast_round_float!(f32, f64);
+impl_cast_float!(f32, f64);
 
-// ---- PartialOrd for range checking ----
-// All primitives already implement PartialOrd, so the < > comparisons in
-// convert_element work naturally.
-
-// ---- FromF64 impls (for wrap mode) ----
+// ---- FromF64 impls ----
 
 macro_rules! impl_from_f64 {
     ($($ty:ty),*) => {
@@ -514,7 +554,7 @@ macro_rules! impl_cast_into {
 
 // Helper: for float→int, the min/max are the integer bounds as floats.
 // For int→int, the min/max are the integer bounds clamped to the source range.
-// For any→float, range checking is skipped (IS_INTEGER is false for float Dst),
+// For any→float, range checking is skipped (target is float, no range check),
 // so min/max values don't matter, but we still need the impl.
 
 // -- int→int --
@@ -552,7 +592,7 @@ macro_rules! impl_to_float {
     ($src:ty => $dst:ty) => {
         impl_cast_into!(
             $src => $dst,
-            min: 0 as $src,  // unused, IS_INTEGER is false for float Dst
+            min: 0 as $src,  // unused — no range check for float targets
             max: 0 as $src
         );
     };
@@ -612,96 +652,108 @@ impl_all_to_float!(f64 => f32, f64);
 mod tests {
     use super::*;
 
-    fn cfg<Src: CastType, Dst: CastType>(
+    // Helper to build FloatToIntConfig
+    fn f2i_cfg<Src: CastFloat, Dst: CastInt>(
         map: &[MapEntry<Src, Dst>],
         rounding: RoundingMode,
         oor: Option<OutOfRangeMode>,
-    ) -> ConvertConfig<'_, Src, Dst> {
-        ConvertConfig {
+    ) -> FloatToIntConfig<'_, Src, Dst> {
+        FloatToIntConfig {
             map_entries: map,
             rounding,
             out_of_range: oor,
         }
     }
 
+    // Helper to build IntToIntConfig
+    fn i2i_cfg<Src: CastInt, Dst: CastInt>(
+        map: &[MapEntry<Src, Dst>],
+        oor: Option<OutOfRangeMode>,
+    ) -> IntToIntConfig<'_, Src, Dst> {
+        IntToIntConfig {
+            map_entries: map,
+            out_of_range: oor,
+        }
+    }
+
     #[test]
     fn test_float64_to_uint8_basic() {
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(42.0_f64, &c).unwrap(), 42_u8);
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        assert_eq!(convert_float_to_int(42.0_f64, &c).unwrap(), 42_u8);
     }
 
     #[test]
     fn test_float64_to_uint8_rounding() {
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
         // 2.5 rounds to 2 (banker's rounding)
-        assert_eq!(convert_element(2.5_f64, &c).unwrap(), 2_u8);
+        assert_eq!(convert_float_to_int(2.5_f64, &c).unwrap(), 2_u8);
         // 3.5 rounds to 4
-        assert_eq!(convert_element(3.5_f64, &c).unwrap(), 4_u8);
+        assert_eq!(convert_float_to_int(3.5_f64, &c).unwrap(), 4_u8);
     }
 
     #[test]
     fn test_float64_to_uint8_clamp() {
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Clamp));
-        assert_eq!(convert_element(300.0_f64, &c).unwrap(), 255_u8);
-        assert_eq!(convert_element(-10.0_f64, &c).unwrap(), 0_u8);
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Clamp));
+        assert_eq!(convert_float_to_int(300.0_f64, &c).unwrap(), 255_u8);
+        assert_eq!(convert_float_to_int(-10.0_f64, &c).unwrap(), 0_u8);
     }
 
     #[test]
     fn test_float64_to_int8_wrap() {
-        let c = cfg::<f64, i8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
         // 200 wraps: (200 - (-128)) % 256 + (-128) = 328 % 256 + (-128) = 72 + (-128) = -56
-        assert_eq!(convert_element(200.0_f64, &c).unwrap(), -56_i8);
+        assert_eq!(convert_float_to_int(200.0_f64, &c).unwrap(), -56_i8);
     }
 
     #[test]
     fn test_int32_to_int8_wrap() {
-        let c = cfg::<i32, i8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
+        let c = i2i_cfg::<i32, i8>(&[], Some(OutOfRangeMode::Wrap));
         // 200_i32 as i8 = -56 (bit truncation = modular wrap)
-        assert_eq!(convert_element(200_i32, &c).unwrap(), -56_i8);
-        assert_eq!(convert_element(-200_i32, &c).unwrap(), 56_i8);
+        assert_eq!(convert_int_to_int(200_i32, &c).unwrap(), -56_i8);
+        assert_eq!(convert_int_to_int(-200_i32, &c).unwrap(), 56_i8);
     }
 
     #[test]
     fn test_int32_to_uint8_wrap() {
-        let c = cfg::<i32, u8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
-        assert_eq!(convert_element(300_i32, &c).unwrap(), 44_u8);
-        assert_eq!(convert_element(-1_i32, &c).unwrap(), 255_u8);
+        let c = i2i_cfg::<i32, u8>(&[], Some(OutOfRangeMode::Wrap));
+        assert_eq!(convert_int_to_int(300_i32, &c).unwrap(), 44_u8);
+        assert_eq!(convert_int_to_int(-1_i32, &c).unwrap(), 255_u8);
     }
 
     #[test]
     fn test_out_of_range_error() {
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        assert!(convert_element(300.0_f64, &c).is_err());
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        assert!(convert_float_to_int(300.0_f64, &c).is_err());
     }
 
     #[test]
     fn test_nan_to_int_error() {
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        assert!(convert_element(f64::NAN, &c).is_err());
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        assert!(convert_float_to_int(f64::NAN, &c).is_err());
     }
 
     #[test]
     fn test_inf_to_int_error() {
         // Without out_of_range, Inf is caught by the range check (OutOfRange error)
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        assert!(convert_element(f64::INFINITY, &c).is_err());
-        assert!(convert_element(f64::NEG_INFINITY, &c).is_err());
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        assert!(convert_float_to_int(f64::INFINITY, &c).is_err());
+        assert!(convert_float_to_int(f64::NEG_INFINITY, &c).is_err());
     }
 
     #[test]
     fn test_inf_to_int_clamp() {
         // With clamp, +Inf clamps to max, -Inf clamps to min
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Clamp));
-        assert_eq!(convert_element(f64::INFINITY, &c).unwrap(), 255_u8);
-        assert_eq!(convert_element(f64::NEG_INFINITY, &c).unwrap(), 0_u8);
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Clamp));
+        assert_eq!(convert_float_to_int(f64::INFINITY, &c).unwrap(), 255_u8);
+        assert_eq!(convert_float_to_int(f64::NEG_INFINITY, &c).unwrap(), 0_u8);
     }
 
     #[test]
     fn test_inf_to_int_wrap_errors() {
         // With wrap, Inf is rejected (rem_euclid(Inf) is NaN)
-        let c = cfg::<f64, i8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
-        assert!(convert_element(f64::INFINITY, &c).is_err());
-        assert!(convert_element(f64::NEG_INFINITY, &c).is_err());
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Wrap));
+        assert!(convert_float_to_int(f64::INFINITY, &c).is_err());
+        assert!(convert_float_to_int(f64::NEG_INFINITY, &c).is_err());
     }
 
     #[test]
@@ -710,8 +762,8 @@ mod tests {
             src: f64::NAN,
             tgt: 0_u8,
         }];
-        let c = cfg(&entries, RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(f64::NAN, &c).unwrap(), 0_u8);
+        let c = f2i_cfg(&entries, RoundingMode::NearestEven, None);
+        assert_eq!(convert_float_to_int(f64::NAN, &c).unwrap(), 0_u8);
     }
 
     #[test]
@@ -721,25 +773,25 @@ mod tests {
             src: f64::NAN,
             tgt: 42_u8,
         }];
-        let c = cfg(&entries, RoundingMode::NearestEven, None);
+        let c = f2i_cfg(&entries, RoundingMode::NearestEven, None);
 
         // Standard NaN
-        assert_eq!(convert_element(f64::NAN, &c).unwrap(), 42_u8);
+        assert_eq!(convert_float_to_int(f64::NAN, &c).unwrap(), 42_u8);
 
         // NaN with custom payload (different bit pattern, still NaN)
         let nan_payload = f64::from_bits(0x7FF8_0000_0000_0001);
         assert!(nan_payload.is_nan());
-        assert_eq!(convert_element(nan_payload, &c).unwrap(), 42_u8);
+        assert_eq!(convert_float_to_int(nan_payload, &c).unwrap(), 42_u8);
 
         // Negative NaN (sign bit set)
         let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
         assert!(neg_nan.is_nan());
-        assert_eq!(convert_element(neg_nan, &c).unwrap(), 42_u8);
+        assert_eq!(convert_float_to_int(neg_nan, &c).unwrap(), 42_u8);
 
         // Signaling NaN (quiet bit clear, payload nonzero)
         let snan = f64::from_bits(0x7FF0_0000_0000_0001);
         assert!(snan.is_nan());
-        assert_eq!(convert_element(snan, &c).unwrap(), 42_u8);
+        assert_eq!(convert_float_to_int(snan, &c).unwrap(), 42_u8);
     }
 
     #[test]
@@ -748,32 +800,32 @@ mod tests {
             src: 42.0_f64,
             tgt: 99_u8,
         }];
-        let c = cfg(&entries, RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(42.0_f64, &c).unwrap(), 99_u8);
+        let c = f2i_cfg(&entries, RoundingMode::NearestEven, None);
+        assert_eq!(convert_float_to_int(42.0_f64, &c).unwrap(), 99_u8);
         // Non-matching value goes through normal path
-        assert_eq!(convert_element(10.0_f64, &c).unwrap(), 10_u8);
+        assert_eq!(convert_float_to_int(10.0_f64, &c).unwrap(), 10_u8);
     }
 
     #[test]
     fn test_int32_to_uint8_range_check() {
-        let c = cfg::<i32, u8>(&[], RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(100_i32, &c).unwrap(), 100_u8);
-        assert!(convert_element(300_i32, &c).is_err());
-        assert!(convert_element(-1_i32, &c).is_err());
+        let c = i2i_cfg::<i32, u8>(&[], None);
+        assert_eq!(convert_int_to_int(100_i32, &c).unwrap(), 100_u8);
+        assert!(convert_int_to_int(300_i32, &c).is_err());
+        assert!(convert_int_to_int(-1_i32, &c).is_err());
     }
 
     #[test]
     fn test_int32_to_float64() {
-        let c = cfg::<i32, f64>(&[], RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(42_i32, &c).unwrap(), 42.0_f64);
+        let c = IntToFloatConfig::<i32, f64> { map_entries: &[] };
+        assert_eq!(convert_int_to_float(42_i32, &c).unwrap(), 42.0_f64);
     }
 
     #[test]
     fn test_convert_slice_basic() {
         let src = [1.0_f64, 2.0, 3.0, 4.0];
         let mut dst = [0_u8; 4];
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        convert_slice(&src, &mut dst, &c).unwrap();
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        convert_slice_float_to_int(&src, &mut dst, &c).unwrap();
         assert_eq!(dst, [1, 2, 3, 4]);
     }
 
@@ -781,8 +833,8 @@ mod tests {
     fn test_convert_slice_early_termination() {
         let src = [1.0_f64, 2.0, 300.0, 4.0];
         let mut dst = [0_u8; 4];
-        let c = cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
-        let result = convert_slice(&src, &mut dst, &c);
+        let c = f2i_cfg::<f64, u8>(&[], RoundingMode::NearestEven, None);
+        let result = convert_slice_float_to_int(&src, &mut dst, &c);
         assert!(result.is_err());
         // First two should have been written
         assert_eq!(dst[0], 1);
@@ -792,42 +844,39 @@ mod tests {
     #[test]
     fn test_all_rounding_modes() {
         // towards-zero
-        let c = cfg::<f64, i8>(&[], RoundingMode::TowardsZero, None);
-        assert_eq!(convert_element(2.7_f64, &c).unwrap(), 2_i8);
-        assert_eq!(convert_element(-2.7_f64, &c).unwrap(), -2_i8);
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::TowardsZero, None);
+        assert_eq!(convert_float_to_int(2.7_f64, &c).unwrap(), 2_i8);
+        assert_eq!(convert_float_to_int(-2.7_f64, &c).unwrap(), -2_i8);
 
         // towards-positive
-        let c = cfg::<f64, i8>(&[], RoundingMode::TowardsPositive, None);
-        assert_eq!(convert_element(2.1_f64, &c).unwrap(), 3_i8);
-        assert_eq!(convert_element(-2.7_f64, &c).unwrap(), -2_i8);
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::TowardsPositive, None);
+        assert_eq!(convert_float_to_int(2.1_f64, &c).unwrap(), 3_i8);
+        assert_eq!(convert_float_to_int(-2.7_f64, &c).unwrap(), -2_i8);
 
         // towards-negative
-        let c = cfg::<f64, i8>(&[], RoundingMode::TowardsNegative, None);
-        assert_eq!(convert_element(2.7_f64, &c).unwrap(), 2_i8);
-        assert_eq!(convert_element(-2.1_f64, &c).unwrap(), -3_i8);
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::TowardsNegative, None);
+        assert_eq!(convert_float_to_int(2.7_f64, &c).unwrap(), 2_i8);
+        assert_eq!(convert_float_to_int(-2.1_f64, &c).unwrap(), -3_i8);
 
         // nearest-away
-        let c = cfg::<f64, i8>(&[], RoundingMode::NearestAway, None);
-        assert_eq!(convert_element(2.5_f64, &c).unwrap(), 3_i8);
-        assert_eq!(convert_element(-2.5_f64, &c).unwrap(), -3_i8);
+        let c = f2i_cfg::<f64, i8>(&[], RoundingMode::NearestAway, None);
+        assert_eq!(convert_float_to_int(2.5_f64, &c).unwrap(), 3_i8);
+        assert_eq!(convert_float_to_int(-2.5_f64, &c).unwrap(), -3_i8);
     }
 
     #[test]
     fn test_int64_to_int32_clamp() {
-        let c = cfg::<i64, i32>(&[], RoundingMode::NearestEven, Some(OutOfRangeMode::Clamp));
-        assert_eq!(
-            convert_element(i64::MAX, &c).unwrap(),
-            i32::MAX
-        );
-        assert_eq!(
-            convert_element(i64::MIN, &c).unwrap(),
-            i32::MIN
-        );
+        let c = i2i_cfg::<i64, i32>(&[], Some(OutOfRangeMode::Clamp));
+        assert_eq!(convert_int_to_int(i64::MAX, &c).unwrap(), i32::MAX);
+        assert_eq!(convert_int_to_int(i64::MIN, &c).unwrap(), i32::MIN);
     }
 
     #[test]
     fn test_float32_to_float64() {
-        let c = cfg::<f32, f64>(&[], RoundingMode::NearestEven, None);
-        assert_eq!(convert_element(3.14_f32, &c).unwrap(), 3.14_f32 as f64);
+        let c = FloatToFloatConfig::<f32, f64> { map_entries: &[] };
+        assert_eq!(
+            convert_float_to_float(3.14_f32, &c).unwrap(),
+            3.14_f32 as f64
+        );
     }
 }

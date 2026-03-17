@@ -1,13 +1,14 @@
 //! zarr-cast-value: PyO3 bindings for the cast_value codec.
 //!
 //! Exposes `cast_array` and `cast_array_into` to Python, dispatching on
-//! numpy dtype pairs to monomorphized `convert_slice` calls from the core crate.
+//! numpy dtype pairs to monomorphized conversion calls from the core crate.
 
 use numpy::{PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use zarr_cast_value_core::{
-    CastError, ConvertConfig, FromF64, MapEntry, OutOfRangeMode, RoundingMode,
+    CastError, CastFloat, CastInt, CastInto, FloatToFloatConfig, FloatToIntConfig, FromF64,
+    IntToFloatConfig, IntToIntConfig, MapEntry, OutOfRangeMode, RoundingMode,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,10 +36,12 @@ fn cast_error_to_pyerr(e: CastError) -> PyErr {
 // Parse scalar_map_entries from Python list[list[float]] into typed MapEntry
 // ---------------------------------------------------------------------------
 
-fn parse_map_entries<Src, Dst>(entries: Option<&Bound<'_, PyList>>) -> PyResult<Vec<MapEntry<Src, Dst>>>
+fn parse_map_entries<Src, Dst>(
+    entries: Option<&Bound<'_, PyList>>,
+) -> PyResult<Vec<MapEntry<Src, Dst>>>
 where
-    Src: zarr_cast_value_core::CastType + FromF64,
-    Dst: zarr_cast_value_core::CastType + FromF64,
+    Src: zarr_cast_value_core::CastNum + FromF64,
+    Dst: zarr_cast_value_core::CastNum + FromF64,
 {
     let Some(list) = entries else {
         return Ok(Vec::new());
@@ -77,9 +80,9 @@ fn dtype_key(kind: char, itemsize: usize) -> PyResult<&'static str> {
         ('u', 8) => Ok("uint64"),
         ('f', 4) => Ok("float32"),
         ('f', 8) => Ok("float64"),
-        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-            format!("Unsupported dtype kind={kind} itemsize={itemsize}"),
-        )),
+        _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "Unsupported dtype kind={kind} itemsize={itemsize}",
+        ))),
     }
 }
 
@@ -91,11 +94,291 @@ fn array_dtype_key(arr: &Bound<'_, pyo3::types::PyAny>) -> PyResult<&'static str
 }
 
 // ---------------------------------------------------------------------------
+// Per-path conversion helpers (avoid duplicating the numpy I/O boilerplate)
+// ---------------------------------------------------------------------------
+
+/// Perform a float→int conversion on numpy arrays.
+fn do_float_to_int_alloc<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    rounding: RoundingMode,
+    oor: Option<OutOfRangeMode>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastFloat + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastInt + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = FloatToIntConfig {
+        map_entries: &map_entries,
+        rounding,
+        out_of_range: oor,
+    };
+    let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
+    {
+        let mut output_rw = unsafe { output.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Failed to get mutable slice from output array",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_float_to_int(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(output.into_pyobject(py)?.into_any().unbind())
+}
+
+/// Perform an int→int conversion on numpy arrays.
+fn do_int_to_int_alloc<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    oor: Option<OutOfRangeMode>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastInt + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastInt + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = IntToIntConfig {
+        map_entries: &map_entries,
+        out_of_range: oor,
+    };
+    let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
+    {
+        let mut output_rw = unsafe { output.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Failed to get mutable slice from output array",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_int_to_int(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(output.into_pyobject(py)?.into_any().unbind())
+}
+
+/// Perform a float→float conversion on numpy arrays.
+fn do_float_to_float_alloc<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastFloat + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastFloat + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = FloatToFloatConfig {
+        map_entries: &map_entries,
+    };
+    let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
+    {
+        let mut output_rw = unsafe { output.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Failed to get mutable slice from output array",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_float_to_float(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(output.into_pyobject(py)?.into_any().unbind())
+}
+
+/// Perform an int→float conversion on numpy arrays.
+fn do_int_to_float_alloc<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastInt + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastFloat + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = IntToFloatConfig {
+        map_entries: &map_entries,
+    };
+    let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
+    let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
+    {
+        let mut output_rw = unsafe { output.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Failed to get mutable slice from output array",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_int_to_float(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(output.into_pyobject(py)?.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
+// Per-path conversion helpers: into variant (pre-allocated output)
+// ---------------------------------------------------------------------------
+
+fn do_float_to_int_into<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    out: &Bound<'py, pyo3::types::PyAny>,
+    rounding: RoundingMode,
+    oor: Option<OutOfRangeMode>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastFloat + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastInt + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = FloatToIntConfig {
+        map_entries: &map_entries,
+        rounding,
+        out_of_range: oor,
+    };
+    let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.downcast()?;
+    {
+        let mut output_rw = unsafe { out_arr.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Output array must be contiguous and writeable",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_float_to_int(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(py.None())
+}
+
+fn do_int_to_int_into<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    out: &Bound<'py, pyo3::types::PyAny>,
+    oor: Option<OutOfRangeMode>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastInt + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastInt + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = IntToIntConfig {
+        map_entries: &map_entries,
+        out_of_range: oor,
+    };
+    let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.downcast()?;
+    {
+        let mut output_rw = unsafe { out_arr.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Output array must be contiguous and writeable",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_int_to_int(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(py.None())
+}
+
+fn do_float_to_float_into<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    out: &Bound<'py, pyo3::types::PyAny>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastFloat + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastFloat + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = FloatToFloatConfig {
+        map_entries: &map_entries,
+    };
+    let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.downcast()?;
+    {
+        let mut output_rw = unsafe { out_arr.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Output array must be contiguous and writeable",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_float_to_float(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(py.None())
+}
+
+fn do_int_to_float_into<'py, Src, Dst>(
+    py: Python<'py>,
+    arr: &Bound<'py, pyo3::types::PyAny>,
+    out: &Bound<'py, pyo3::types::PyAny>,
+    map_entries_py: Option<&Bound<'py, PyList>>,
+) -> PyResult<PyObject>
+where
+    Src: CastInt + CastInto<Dst> + FromF64 + numpy::Element,
+    Dst: CastFloat + FromF64 + numpy::Element,
+{
+    let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
+    let src_slice = input_arr.as_slice().map_err(|_| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
+    })?;
+    let map_entries = parse_map_entries::<Src, Dst>(map_entries_py)?;
+    let config = IntToFloatConfig {
+        map_entries: &map_entries,
+    };
+    let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.downcast()?;
+    {
+        let mut output_rw = unsafe { out_arr.as_array_mut() };
+        let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Output array must be contiguous and writeable",
+            )
+        })?;
+        zarr_cast_value_core::convert_slice_int_to_float(src_slice, dst_slice, &config)
+            .map_err(cast_error_to_pyerr)?;
+    }
+    Ok(py.None())
+}
+
+// ---------------------------------------------------------------------------
 // N×N dispatch: allocating variant
 // ---------------------------------------------------------------------------
 
-/// Dispatch on (src_dtype, tgt_dtype) to call convert_slice with concrete types.
-/// Allocates a new output numpy array.
+/// Dispatch on (src_dtype, tgt_dtype) to call the appropriate conversion
+/// function with concrete types. Allocates a new output numpy array.
 fn dispatch_alloc<'py>(
     py: Python<'py>,
     arr: &Bound<'py, pyo3::types::PyAny>,
@@ -105,66 +388,80 @@ fn dispatch_alloc<'py>(
     oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyList>>,
 ) -> PyResult<PyObject> {
-    // Use a macro to generate all 100 match arms
-    macro_rules! do_convert {
-        ($src_ty:ty, $dst_ty:ty) => {{
-            let input_arr: PyReadonlyArrayDyn<'_, $src_ty> = arr.extract()?;
-            let src_slice = input_arr.as_slice().map_err(|_| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
-            })?;
-            let map_entries = parse_map_entries::<$src_ty, $dst_ty>(map_entries_py)?;
-            let config = ConvertConfig {
-                map_entries: &map_entries,
-                rounding,
-                out_of_range: oor,
-            };
-            let shape: Vec<usize> = arr.getattr("shape")?.extract()?;
-            let output = PyArrayDyn::<$dst_ty>::zeros(py, &shape[..], false);
-            {
-                let mut output_rw = unsafe { output.as_array_mut() };
-                let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "Failed to get mutable slice from output array",
-                    )
-                })?;
-                zarr_cast_value_core::convert_slice(src_slice, dst_slice, &config)
-                    .map_err(cast_error_to_pyerr)?;
-            }
-            Ok(output.into_pyobject(py)?.into_any().unbind())
-        }};
+    // Dispatch uses four path-specific macros to call the right conversion function.
+    macro_rules! float_to_int {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_float_to_int_alloc::<$src_ty, $dst_ty>(py, arr, rounding, oor, map_entries_py)
+        };
+    }
+    macro_rules! int_to_int {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_int_to_int_alloc::<$src_ty, $dst_ty>(py, arr, oor, map_entries_py)
+        };
+    }
+    macro_rules! float_to_float {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_float_to_float_alloc::<$src_ty, $dst_ty>(py, arr, map_entries_py)
+        };
+    }
+    macro_rules! int_to_float {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_int_to_float_alloc::<$src_ty, $dst_ty>(py, arr, map_entries_py)
+        };
     }
 
-    macro_rules! dispatch_dst {
-        ($src_ty:ty, $tgt_dtype:expr) => {
-            match $tgt_dtype {
-                "int8" => do_convert!($src_ty, i8),
-                "int16" => do_convert!($src_ty, i16),
-                "int32" => do_convert!($src_ty, i32),
-                "int64" => do_convert!($src_ty, i64),
-                "uint8" => do_convert!($src_ty, u8),
-                "uint16" => do_convert!($src_ty, u16),
-                "uint32" => do_convert!($src_ty, u32),
-                "uint64" => do_convert!($src_ty, u64),
-                "float32" => do_convert!($src_ty, f32),
-                "float64" => do_convert!($src_ty, f64),
+    // Dispatch on (src_dtype, tgt_dtype) calling the appropriate path.
+    macro_rules! dispatch_int_src {
+        ($src_ty:ty) => {
+            match tgt_dtype {
+                "int8" => int_to_int!($src_ty, i8),
+                "int16" => int_to_int!($src_ty, i16),
+                "int32" => int_to_int!($src_ty, i32),
+                "int64" => int_to_int!($src_ty, i64),
+                "uint8" => int_to_int!($src_ty, u8),
+                "uint16" => int_to_int!($src_ty, u16),
+                "uint32" => int_to_int!($src_ty, u32),
+                "uint64" => int_to_int!($src_ty, u64),
+                "float32" => int_to_float!($src_ty, f32),
+                "float64" => int_to_float!($src_ty, f64),
                 _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {}", $tgt_dtype),
+                    format!("Unsupported target dtype: {tgt_dtype}"),
+                )),
+            }
+        };
+    }
+
+    macro_rules! dispatch_float_src {
+        ($src_ty:ty) => {
+            match tgt_dtype {
+                "int8" => float_to_int!($src_ty, i8),
+                "int16" => float_to_int!($src_ty, i16),
+                "int32" => float_to_int!($src_ty, i32),
+                "int64" => float_to_int!($src_ty, i64),
+                "uint8" => float_to_int!($src_ty, u8),
+                "uint16" => float_to_int!($src_ty, u16),
+                "uint32" => float_to_int!($src_ty, u32),
+                "uint64" => float_to_int!($src_ty, u64),
+                "float32" => float_to_float!($src_ty, f32),
+                "float64" => float_to_float!($src_ty, f64),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("Unsupported target dtype: {tgt_dtype}"),
                 )),
             }
         };
     }
 
     match src_dtype {
-        "int8" => dispatch_dst!(i8, tgt_dtype),
-        "int16" => dispatch_dst!(i16, tgt_dtype),
-        "int32" => dispatch_dst!(i32, tgt_dtype),
-        "int64" => dispatch_dst!(i64, tgt_dtype),
-        "uint8" => dispatch_dst!(u8, tgt_dtype),
-        "uint16" => dispatch_dst!(u16, tgt_dtype),
-        "uint32" => dispatch_dst!(u32, tgt_dtype),
-        "uint64" => dispatch_dst!(u64, tgt_dtype),
-        "float32" => dispatch_dst!(f32, tgt_dtype),
-        "float64" => dispatch_dst!(f64, tgt_dtype),
+        "int8" => dispatch_int_src!(i8),
+        "int16" => dispatch_int_src!(i16),
+        "int32" => dispatch_int_src!(i32),
+        "int64" => dispatch_int_src!(i64),
+        "uint8" => dispatch_int_src!(u8),
+        "uint16" => dispatch_int_src!(u16),
+        "uint32" => dispatch_int_src!(u32),
+        "uint64" => dispatch_int_src!(u64),
+        "float32" => dispatch_float_src!(f32),
+        "float64" => dispatch_float_src!(f64),
         _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
             format!("Unsupported source dtype: {src_dtype}"),
         )),
@@ -185,64 +482,78 @@ fn dispatch_into<'py>(
     oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyList>>,
 ) -> PyResult<PyObject> {
-    macro_rules! do_convert_into {
-        ($src_ty:ty, $dst_ty:ty) => {{
-            let input_arr: PyReadonlyArrayDyn<'_, $src_ty> = arr.extract()?;
-            let src_slice = input_arr.as_slice().map_err(|_| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("Input array must be contiguous")
-            })?;
-            let map_entries = parse_map_entries::<$src_ty, $dst_ty>(map_entries_py)?;
-            let config = ConvertConfig {
-                map_entries: &map_entries,
-                rounding,
-                out_of_range: oor,
-            };
-            let out_arr: &Bound<'_, PyArrayDyn<$dst_ty>> = out.downcast()?;
-            {
-                let mut output_rw = unsafe { out_arr.as_array_mut() };
-                let dst_slice = output_rw.as_slice_mut().ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "Output array must be contiguous and writeable",
-                    )
-                })?;
-                zarr_cast_value_core::convert_slice(src_slice, dst_slice, &config)
-                    .map_err(cast_error_to_pyerr)?;
-            }
-            Ok(py.None())
-        }};
+    macro_rules! float_to_int {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_float_to_int_into::<$src_ty, $dst_ty>(py, arr, out, rounding, oor, map_entries_py)
+        };
+    }
+    macro_rules! int_to_int {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_int_to_int_into::<$src_ty, $dst_ty>(py, arr, out, oor, map_entries_py)
+        };
+    }
+    macro_rules! float_to_float {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_float_to_float_into::<$src_ty, $dst_ty>(py, arr, out, map_entries_py)
+        };
+    }
+    macro_rules! int_to_float {
+        ($src_ty:ty, $dst_ty:ty) => {
+            do_int_to_float_into::<$src_ty, $dst_ty>(py, arr, out, map_entries_py)
+        };
     }
 
-    macro_rules! dispatch_dst_into {
-        ($src_ty:ty, $tgt_dtype:expr) => {
-            match $tgt_dtype {
-                "int8" => do_convert_into!($src_ty, i8),
-                "int16" => do_convert_into!($src_ty, i16),
-                "int32" => do_convert_into!($src_ty, i32),
-                "int64" => do_convert_into!($src_ty, i64),
-                "uint8" => do_convert_into!($src_ty, u8),
-                "uint16" => do_convert_into!($src_ty, u16),
-                "uint32" => do_convert_into!($src_ty, u32),
-                "uint64" => do_convert_into!($src_ty, u64),
-                "float32" => do_convert_into!($src_ty, f32),
-                "float64" => do_convert_into!($src_ty, f64),
+    macro_rules! dispatch_int_src {
+        ($src_ty:ty) => {
+            match tgt_dtype {
+                "int8" => int_to_int!($src_ty, i8),
+                "int16" => int_to_int!($src_ty, i16),
+                "int32" => int_to_int!($src_ty, i32),
+                "int64" => int_to_int!($src_ty, i64),
+                "uint8" => int_to_int!($src_ty, u8),
+                "uint16" => int_to_int!($src_ty, u16),
+                "uint32" => int_to_int!($src_ty, u32),
+                "uint64" => int_to_int!($src_ty, u64),
+                "float32" => int_to_float!($src_ty, f32),
+                "float64" => int_to_float!($src_ty, f64),
                 _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("Unsupported target dtype: {}", $tgt_dtype),
+                    format!("Unsupported target dtype: {tgt_dtype}"),
+                )),
+            }
+        };
+    }
+
+    macro_rules! dispatch_float_src {
+        ($src_ty:ty) => {
+            match tgt_dtype {
+                "int8" => float_to_int!($src_ty, i8),
+                "int16" => float_to_int!($src_ty, i16),
+                "int32" => float_to_int!($src_ty, i32),
+                "int64" => float_to_int!($src_ty, i64),
+                "uint8" => float_to_int!($src_ty, u8),
+                "uint16" => float_to_int!($src_ty, u16),
+                "uint32" => float_to_int!($src_ty, u32),
+                "uint64" => float_to_int!($src_ty, u64),
+                "float32" => float_to_float!($src_ty, f32),
+                "float64" => float_to_float!($src_ty, f64),
+                _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("Unsupported target dtype: {tgt_dtype}"),
                 )),
             }
         };
     }
 
     match src_dtype {
-        "int8" => dispatch_dst_into!(i8, tgt_dtype),
-        "int16" => dispatch_dst_into!(i16, tgt_dtype),
-        "int32" => dispatch_dst_into!(i32, tgt_dtype),
-        "int64" => dispatch_dst_into!(i64, tgt_dtype),
-        "uint8" => dispatch_dst_into!(u8, tgt_dtype),
-        "uint16" => dispatch_dst_into!(u16, tgt_dtype),
-        "uint32" => dispatch_dst_into!(u32, tgt_dtype),
-        "uint64" => dispatch_dst_into!(u64, tgt_dtype),
-        "float32" => dispatch_dst_into!(f32, tgt_dtype),
-        "float64" => dispatch_dst_into!(f64, tgt_dtype),
+        "int8" => dispatch_int_src!(i8),
+        "int16" => dispatch_int_src!(i16),
+        "int32" => dispatch_int_src!(i32),
+        "int64" => dispatch_int_src!(i64),
+        "uint8" => dispatch_int_src!(u8),
+        "uint16" => dispatch_int_src!(u16),
+        "uint32" => dispatch_int_src!(u32),
+        "uint64" => dispatch_int_src!(u64),
+        "float32" => dispatch_float_src!(f32),
+        "float64" => dispatch_float_src!(f64),
         _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
             format!("Unsupported source dtype: {src_dtype}"),
         )),
@@ -267,7 +578,15 @@ fn cast_array<'py>(
     let oor = parse_out_of_range(out_of_range_mode)?;
     let src_dtype = array_dtype_key(arr)?;
 
-    dispatch_alloc(py, arr, src_dtype, target_dtype, rounding, oor, scalar_map_entries)
+    dispatch_alloc(
+        py,
+        arr,
+        src_dtype,
+        target_dtype,
+        rounding,
+        oor,
+        scalar_map_entries,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +618,16 @@ fn cast_array_into<'py>(
         )));
     }
 
-    dispatch_into(py, arr, out, src_dtype, tgt_dtype, rounding, oor, scalar_map_entries)
+    dispatch_into(
+        py,
+        arr,
+        out,
+        src_dtype,
+        tgt_dtype,
+        rounding,
+        oor,
+        scalar_map_entries,
+    )
 }
 
 // ---------------------------------------------------------------------------

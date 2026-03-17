@@ -43,7 +43,7 @@ Pure Rust. No PyO3, no numpy crate, no Python dependency. Contains:
 
 - Layers 1 and 2 (see below): `convert_element`, `convert_slice`
 - Type definitions: `RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`
-- Trait definitions: `CastSource`, `CastTarget`, `CastInto`
+- Trait definitions: `CastNum`, `CastInt`, `CastFloat`, `CastInto`
 - Trait implementations for built-in numeric types + external types behind
   feature flags
 
@@ -62,49 +62,75 @@ PyO3 + numpy bindings. Depends on `zarr-cast-value-core`. Contains:
 
 ## Architecture: Four Layers
 
-### Layer 1: Per-element transform (`convert_element`)
+### Layer 1: Per-element transform (four conversion functions)
 
 *Crate: core*
 
 Takes a source value in its native type and produces a target value in the
-target type. There is no intermediate representation — the function operates
-directly on `Src` and `Dst`:
+target type. There is no intermediate representation — each function operates
+directly on `Src` and `Dst`.
+
+Rather than a single generic `convert_element` that uses runtime `IS_FLOAT` /
+`IS_INTEGER` flags to decide which steps apply, we use **four separate
+functions** — one per conversion category. This eliminates runtime type-flag
+checks and `unreachable!` default implementations: each function's trait bounds
+statically guarantee that only valid operations are called.
 
 ```
-fn convert_element<Src, Dst>(val: Src, map, rounding, range) -> Result<Dst>:
-    1. scalar_map lookup (if entries provided, first match wins)
-    2. reject NaN/Inf (if Src is floating and Dst is int)
-    3. round (if Src is floating and Dst is int)
-    4. range check + clamp/wrap (int Dst only)
+fn convert_float_to_int<Src: CastFloat, Dst: CastInt>(val, map, rounding, range) -> Result<Dst>:
+    1. scalar_map lookup (first match wins)
+    2. reject NaN
+    3. round
+    4. range check + clamp/wrap (wrap uses rem_euclid on the source float)
     5. cast Src → Dst
-    return converted value
+
+fn convert_int_to_int<Src: CastInt, Dst: CastInt>(val, map, range) -> Result<Dst>:
+    1. scalar_map lookup (first match wins)
+    2. range check + clamp/wrap (wrap uses bit-truncating `as` cast)
+    3. cast Src → Dst
+
+fn convert_float_to_float<Src: CastFloat, Dst: CastFloat>(val, map) -> Result<Dst>:
+    1. scalar_map lookup (first match wins)
+    2. cast Src → Dst
+
+fn convert_int_to_float<Src: CastInt, Dst: CastFloat>(val, map) -> Result<Dst>:
+    1. scalar_map lookup (first match wins)
+    2. cast Src → Dst
 ```
 
-This is a pure function with no allocations. All the cast semantics live here.
+Each function is a pure function with no allocations. The trait bounds ensure:
+- Rounding (`round`) is only callable on `CastFloat` sources.
+- NaN/Inf checks (`is_nan`, `is_infinite`) are only callable on `CastFloat` sources.
+- Float-only arithmetic (`rem_euclid`, `sub`, `add`, `one`) is only available
+  on `CastFloat` types — no `unreachable!` fallback needed.
+- Range checking is only applied when the target is `CastInt`.
 
-Steps 1–4 operate on the source type. Rounding uses the source float's own
+Steps operate on the source type. Rounding uses the source float's own
 precision. Range checking compares against the target type's bounds. The actual
-type conversion (step 5) happens once, at the end, after all validation has
-passed.
+type conversion happens once, at the end, after all validation has passed.
 
 For example, `float64 → uint8`: the f64 value gets scalar-mapped, rounded, and
 range-checked — all as f64 — then converted to u8. For `int32 → uint8`: the i32
 value gets range-checked as i32, then converted to u8. No intermediate buffer.
 
-### Layer 2: Slice transform (`convert_slice`)
+### Layer 2: Slice transform (`convert_slice_*`)
 
 *Crate: core*
 
-Iterates over a source slice `&[Src]` and writes converted values into a
+Four slice-level functions mirror the four element-level functions:
+`convert_slice_float_to_int`, `convert_slice_int_to_int`,
+`convert_slice_float_to_float`, `convert_slice_int_to_float`.
+
+Each iterates over a source slice `&[Src]` and writes converted values into a
 caller-provided output slice `&mut [Dst]`. Returns early on the first error
 (e.g. out-of-range value with no clamp/wrap, or unconvertible NaN/Inf).
 
 ```
-fn convert_slice<Src, Dst>(
+fn convert_slice_float_to_int<Src: CastFloat, Dst: CastInt>(
     src: &[Src], dst: &mut [Dst], map, rounding, range,
 ) -> Result<()>:
     for (in_val, out_slot) in src.iter().zip(dst.iter_mut()):
-        *out_slot = convert_element(in_val)?   // early return on Err
+        *out_slot = convert_float_to_int(in_val, ...)?
     Ok(())
 ```
 
@@ -112,6 +138,9 @@ This layer owns the iteration but not the allocation. The caller provides both
 buffers, so this function is agnostic to how memory is managed (stack, heap,
 numpy-owned, etc.). Early termination means we don't waste time converting
 remaining elements after the first failure.
+
+When no scalar map entries are present, each function uses a tighter inner loop
+that skips the map lookup entirely, allowing better optimization.
 
 ### Layer 3: Buffer management + dtype dispatch
 
@@ -182,7 +211,8 @@ harder to reason about correctness.
 - **Int→int wrap**: Uses Rust's `as` cast (bit truncation = modular arithmetic).
   No intermediate type needed.
 - **Float→int wrap**: Uses `rem_euclid` on the source float type directly,
-  via the `CastFloat` trait. No promotion to f64.
+  available because the function's `CastFloat` bound guarantees this operation
+  exists. No promotion to f64.
 - **Final cast**: A single `Src → Dst` conversion at the end of the pipeline.
 
 ### Per-path summary
@@ -301,51 +331,69 @@ types are rejected by `CastValue.validate()` before data reaches this code.
 
 ### Trait design for type extensibility
 
-The `convert_element` and `convert_slice` functions are generic over `Src` and
-`Dst`. For this to work, the types must implement three traits:
+The conversion functions are generic over `Src` and `Dst`. Rather than a single
+`CastType` trait with boolean `IS_FLOAT`/`IS_INTEGER` flags and `unreachable!`
+default implementations for float-only operations, we use **separate traits for
+integer and float types**. This lets the type system enforce which operations
+are valid, eliminating runtime type checks and dead code.
+
+The `num-traits` crate (already a dependency) provides standard numeric trait
+bounds (`NumCast`, `ToPrimitive`, `Float`, `PrimInt`, etc.) that are used where
+appropriate to avoid reimplementing standard numeric operations.
 
 ```rust
-/// A numeric type that can be a cast_value source or target.
-/// All comparisons and matching happen in native type space — no f64 conversion.
-trait CastType: Copy + PartialEq {
-    fn is_nan(self) -> bool;          // for scalar_map NaN matching
-    fn is_infinite(self) -> bool;     // for float→int NaN/Inf rejection
-    const IS_FLOAT: bool;            // controls whether rounding applies
-    const IS_INTEGER: bool;          // controls whether range check applies
+/// Common base for all numeric types that participate in cast_value conversions.
+/// Provides only the operations shared by both integers and floats.
+trait CastNum: Copy + PartialEq + PartialOrd + Debug {
+    /// Convert to f64 for error reporting only (not in the conversion hot path).
+    fn to_f64_lossy(self) -> f64;
 }
 
-/// Rounding support for float source types.
-/// Integer types implement this as a no-op.
-trait CastRound: CastType {
+/// An integer numeric type. Implemented by i8..i64, u8..u64.
+/// No NaN, no Inf, no rounding needed.
+trait CastInt: CastNum {}
+
+/// A floating-point numeric type. Implemented by f32, f64.
+/// Carries all float-specific operations that the old CastType put behind
+/// `unreachable!` defaults.
+trait CastFloat: CastNum {
+    fn is_nan(self) -> bool;
+    fn is_infinite(self) -> bool;
     fn round(self, mode: RoundingMode) -> Self;
+    fn rem_euclid(self, rhs: Self) -> Self;
+    fn one() -> Self;
+    // Standard arithmetic via core::ops::Add/Sub
 }
 
-/// Conversion from Src to Dst.
-/// This is the trait that makes step 5 (the final cast) work generically.
-trait CastInto<Dst>: CastType {
-    /// Convert self to Dst, or error if the value is out of range.
-    fn cast_into(self) -> Result<Dst, CastError>;
-
-    /// The minimum value of Dst, representable in Src's type.
-    /// Used for range checking before conversion.
+/// Conversion from Src to Dst. Implemented per (Src, Dst) pair.
+trait CastInto<Dst>: CastNum {
     fn dst_min() -> Self;
-
-    /// The maximum value of Dst, representable in Src's type.
     fn dst_max() -> Self;
-
-    /// Clamp self to [dst_min, dst_max] and convert.
-    fn cast_clamped(self) -> Dst;
-
-    /// Wrap self into Dst's range via modular arithmetic and convert.
-    fn cast_wrapped(self) -> Dst;
+    fn cast_into(self) -> Dst;
 }
 ```
 
 Key design points:
 
-- **No `to_f64`/`from_f64`**: Scalar map comparison uses `PartialEq` on `Src`
-  directly. Map entries are typed as `MapEntry<Src, Dst>` — the source field is
-  `Src`, not f64. This avoids precision loss for int64/uint64 values > 2^53.
+- **Separate int/float traits eliminate `unreachable!`**: Float-only operations
+  (`is_nan`, `is_infinite`, `round`, `rem_euclid`, `one`) live exclusively on
+  `CastFloat`. Integer types don't implement them at all — calling them on an
+  integer is a compile error, not a runtime panic. Similarly, the four conversion
+  functions use trait bounds to select the right path at compile time instead of
+  runtime `IS_FLOAT`/`IS_INTEGER` checks.
+
+- **`num-traits` integration**: The `num-traits` crate provides `Float`,
+  `PrimInt`, `NumCast`, and `ToPrimitive` traits that overlap with our needs.
+  We use `num_traits::Float` for `is_nan()`, `is_infinite()`, `round()`, etc.
+  on float types. Our custom traits (`CastFloat`, `CastInt`) exist primarily
+  to bundle the specific subset of operations needed by the conversion pipeline
+  and to provide the `CastInto` range-bound mechanism, which `num-traits` does
+  not cover.
+
+- **No `to_f64`/`from_f64` on the hot path**: Scalar map comparison uses
+  `PartialEq` on `Src` directly. Map entries are typed as `MapEntry<Src, Dst>`
+  — the source field is `Src`, not f64. This avoids precision loss for
+  int64/uint64 values > 2^53.
 
 - **`CastInto<Dst>` carries the range bounds in `Src` space**: `dst_min()` and
   `dst_max()` return `Src` values, so range checking compares source values
@@ -354,9 +402,7 @@ Key design points:
 
 - **`CastInto` is implemented per `(Src, Dst)` pair**: This is the one place
   where the `N × N` combinatorics show up in the core crate. But each impl is
-  trivial — just an `as` cast after the range check has already passed. The
-  `cast_clamped` and `cast_wrapped` methods similarly delegate to `as` after
-  the appropriate transformation.
+  trivial — just an `as` cast after the range check has already passed.
 
 - **Scalar map `MapEntry<Src, Dst>`**: The source field is `Src` (not f64), so
   comparison is `val == entry.src` in native type space. The target field is
@@ -437,7 +483,7 @@ pair stored as `MapEntry<Src, Dst>`. For each element:
 2. Otherwise → exact equality: `val == entry.src` (in native `Src` type)
 
 On match, the element is replaced with `entry.tgt` (native `Dst` type) and
-`convert_element` returns immediately — no rounding or range check needed
+the conversion function returns immediately — no rounding or range check needed
 since the target value was explicitly chosen.
 
 First matching entry wins; unmatched values continue through the pipeline.
@@ -537,7 +583,11 @@ uv run --with maturin maturin develop
 
 ### Core crate dependencies
 
-- `num-traits = "0.2"` — numeric trait bounds for the generic type parameters
+No external dependencies. The `CastFloat` and `CastInt` traits define exactly
+the operations needed for conversion, using only `std` types and operations.
+The `num-traits` crate was evaluated but is not needed — our custom traits
+provide a tighter interface than `num_traits::Float` / `num_traits::PrimInt`,
+and avoid pulling in unused functionality.
 
 ### Python crate dependencies
 
@@ -556,7 +606,7 @@ The core crate has no Python dependency, so zarrs can use it directly.
 zarrs would depend on `zarr-cast-value-core` and implement the codec adapter
 on their side. The core crate exposes `convert_element`, `convert_slice`, and
 the supporting types (`RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`,
-`CastType`, `CastRound`, `CastInto`).
+`CastNum`, `CastInt`, `CastFloat`, `CastInto`).
 
 A zarrs-side `CastValue` struct would implement `ArrayToArrayCodecTraits`. Its
 `encode`/`decode` methods would:
@@ -566,11 +616,11 @@ A zarrs-side `CastValue` struct would implement `ArrayToArrayCodecTraits`. Its
    typed `MapEntry<Src, Dst>` values
 3. Reinterpret `ArrayBytes::Fixed` as a typed `&[Src]` slice
 4. Allocate an output `Vec<u8>` for the target type, view as `&mut [Dst]`
-5. Call `zarr_cast_value_core::convert_slice` to do the conversion
+5. Call the appropriate `zarr_cast_value_core::convert_slice_*` function
 6. Return the output as `ArrayBytes::Fixed`
 
 Steps 1–4 and 6 are zarrs-specific (byte reinterpretation, `DataType` dispatch,
-JSON scalar parsing). Step 5 is the core crate — the same `convert_slice` that
+JSON scalar parsing). Step 5 is the core crate — the same `convert_slice_*` functions that
 the Python bindings use.
 
 This approach keeps the core crate minimal and avoids version coupling between

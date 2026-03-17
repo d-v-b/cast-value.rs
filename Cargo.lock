@@ -266,6 +266,3 @@ dependencies = [
 [[package]]
 name = "zarr-cast-value-core"
 version = "0.1.0"
-dependencies = [
- "num-traits",
-]
