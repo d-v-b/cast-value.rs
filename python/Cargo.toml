@@ -3,6 +3,8 @@ name = "cast-value-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Python bindings for the Zarr cast_value codec"
+repository = "https://github.com/zarr-developers/cast-value.rs"
 
 [lib]
 name = "_cast_value_rs"

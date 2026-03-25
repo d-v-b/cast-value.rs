@@ -3,6 +3,9 @@ name = "zarr-cast-value-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Core casting logic for the Zarr cast_value codec"
+repository = "https://github.com/zarr-developers/cast-value.rs"
+readme = "../README.md"
 
 [dependencies]
 num-traits = "0.2"
