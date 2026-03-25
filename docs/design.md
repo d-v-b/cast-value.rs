@@ -27,7 +27,7 @@ The project is split into two crates:
 
 ```
 zarr-cast-value/
-  core/           # zarr-cast-value-core: pure Rust library, no Python dependency
+  core/           # zarr-cast-value: pure Rust library, no Python dependency
     src/lib.rs
     Cargo.toml
   python/         # zarr-cast-value: PyO3 bindings, depends on core
@@ -37,7 +37,7 @@ zarr-cast-value/
   Cargo.toml      # workspace
 ```
 
-### `zarr-cast-value-core` (library crate)
+### `zarr-cast-value` (library crate)
 
 Pure Rust. No PyO3, no numpy crate, no Python dependency. Contains:
 
@@ -53,7 +53,7 @@ other Rust consumers (e.g. zarrs) without pulling in Python bindings.
 
 ### `zarr-cast-value` (cdylib crate)
 
-PyO3 + numpy bindings. Depends on `zarr-cast-value-core`. Contains:
+PyO3 + numpy bindings. Depends on `zarr-cast-value`. Contains:
 
 - A numpy-specific layer 3: numpy array I/O, dtype dispatch, `#[pyfunction]`
 - Argument parsing (strings → Rust enums)
@@ -429,7 +429,7 @@ dependencies when needed.
 ### Required external crate dependencies
 
 ```toml
-# zarr-cast-value-core/Cargo.toml
+# zarr-cast-value/Cargo.toml
 [features]
 default = []
 float16 = ["dep:half"]       # f16 — part of core spec, but needs external crate
@@ -609,7 +609,7 @@ The `CastValue` codec in `src/zarr/codecs/cast_value.py` calls the Rust function
 as a drop-in replacement for `_cast_array_impl`:
 
 ```python
-from zarr_cast_value import cast_array as _rust_cast_array
+from cast_value_rs import cast_array as _rust_cast_array
 
 # In _cast_array:
 result = _rust_cast_array(
@@ -650,7 +650,7 @@ and avoid pulling in unused functionality.
 
 ### Python crate dependencies
 
-- `zarr-cast-value-core` (path dependency)
+- `zarr-cast-value` (path dependency)
 - `pyo3 = "0.23"` — Rust↔Python bindings
 - `numpy = "0.23"` — numpy array interop for PyO3
 
@@ -662,7 +662,7 @@ The core crate has no Python dependency, so zarrs can use it directly.
 
 ### How zarrs would use the core crate
 
-zarrs would depend on `zarr-cast-value-core` and implement the codec adapter
+zarrs would depend on `zarr-cast-value` and implement the codec adapter
 on their side. The core crate exposes the four per-element conversion functions,
 the four slice conversion functions, and the supporting types and traits
 (`RoundingMode`, `OutOfRangeMode`, `MapEntry`, `CastError`, `CastNum`,
@@ -676,7 +676,7 @@ A zarrs-side `CastValue` struct would implement `ArrayToArrayCodecTraits`. Its
    typed `MapEntry<Src, Dst>` values
 3. Reinterpret `ArrayBytes::Fixed` as a typed `&[Src]` slice
 4. Allocate an output `Vec<u8>` for the target type, view as `&mut [Dst]`
-5. Call the appropriate `zarr_cast_value_core::convert_slice_*` function
+5. Call the appropriate `zarr_cast_value::convert_slice_*` function
 6. Return the output as `ArrayBytes::Fixed`
 
 Steps 1–4 and 6 are zarrs-specific (byte reinterpretation, `DataType` dispatch,
