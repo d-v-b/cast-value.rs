@@ -1,4 +1,4 @@
-//! zarr-cast-value: PyO3 bindings for the cast_value codec.
+//! cast-value-rs: PyO3 bindings for the cast_value codec.
 //!
 //! Exposes `cast_array` and `cast_array_into` to Python, dispatching on
 //! numpy dtype pairs to monomorphized conversion calls from the core crate.
@@ -724,7 +724,7 @@ fn cast_array_into<'py>(
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn zarr_cast_value(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn cast_value_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cast_array, m)?)?;
     m.add_function(wrap_pyfunction!(cast_array_into, m)?)?;
     Ok(())

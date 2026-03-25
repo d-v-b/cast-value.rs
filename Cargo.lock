@@ -9,6 +9,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "cast-value-rs"
+version = "0.1.0"
+dependencies = [
+ "numpy",
+ "pyo3",
+ "zarr-cast-value-core",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,15 +337,6 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
-
-[[package]]
-name = "zarr-cast-value"
-version = "0.1.0"
-dependencies = [
- "numpy",
- "pyo3",
- "zarr-cast-value-core",
-]
 
 [[package]]
 name = "zarr-cast-value-core"

@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [tool.maturin]
 python-source = "."
-module-name = "zarr_cast_value.zarr_cast_value"
+module-name = "cast_value_rs.cast_value_rs"
 
 [project]
-name = "zarr-cast-value"
+name = "cast-value-rs"
 requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Rust",

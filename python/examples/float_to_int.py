@@ -7,7 +7,7 @@ the offset of 1 is subtracted from the decoded integers to get back the original
 
 import numpy as np
 from math import nan
-from zarr_cast_value import cast_array
+from cast_value_rs import cast_array
 
 # Original float64 data with NaN representing missing values.
 # All finite values are integers in [0, 1000].

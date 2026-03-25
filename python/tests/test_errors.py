@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from zarr_cast_value import cast_array, cast_array_into
+from cast_value_rs import cast_array, cast_array_into
 
 from .conftest import ExpectFail, ExpectedError
 

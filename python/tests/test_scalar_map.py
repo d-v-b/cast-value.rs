@@ -5,7 +5,7 @@ from math import inf, nan
 import numpy as np
 import pytest
 
-from zarr_cast_value import cast_array
+from cast_value_rs import cast_array
 
 from .conftest import Expect, ExpectFail, ExpectedError, nan_eq
 

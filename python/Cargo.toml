@@ -1,11 +1,11 @@
 [package]
-name = "zarr-cast-value"
+name = "cast-value-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [lib]
-name = "zarr_cast_value"
+name = "cast_value_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
