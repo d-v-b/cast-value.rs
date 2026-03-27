@@ -528,28 +528,50 @@ fn dispatch_alloc<'py>(
     macro_rules! float_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
             do_float_to_int_alloc::<$src_ty, $dst_ty>(
-                py, arr, rounding, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                rounding,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! int_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
             do_int_to_int_alloc::<$src_ty, $dst_ty>(
-                py, arr, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! float_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
             do_float_to_float_alloc::<$src_ty, $dst_ty>(
-                py, arr, rounding, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                rounding,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! int_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
             do_int_to_float_alloc::<$src_ty, $dst_ty>(
-                py, arr, rounding, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                rounding,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
@@ -633,28 +655,54 @@ fn dispatch_into<'py>(
     macro_rules! float_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
             do_float_to_int_into::<$src_ty, $dst_ty>(
-                py, arr, out, rounding, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                out,
+                rounding,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! int_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
             do_int_to_int_into::<$src_ty, $dst_ty>(
-                py, arr, out, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                out,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! float_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
             do_float_to_float_into::<$src_ty, $dst_ty>(
-                py, arr, out, rounding, oor, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                out,
+                rounding,
+                oor,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
     macro_rules! int_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
             do_int_to_float_into::<$src_ty, $dst_ty>(
-                py, arr, out, rounding, map_entries_py, src_dtype, tgt_dtype,
+                py,
+                arr,
+                out,
+                rounding,
+                map_entries_py,
+                src_dtype,
+                tgt_dtype,
             )
         };
     }
