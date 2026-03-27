@@ -11,6 +11,7 @@ name = "_cast_value_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-zarr-cast-value = { path = "../core" }
+zarr-cast-value = { path = "../core", features = ["float16"] }
+half = "2"
 pyo3 = { version = "0.25", features = ["extension-module"] }
-numpy = "0.25"
+numpy = { version = "0.25", features = ["half"] }

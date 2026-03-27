@@ -7,7 +7,12 @@ description = "Core casting logic for the Zarr cast_value codec"
 repository = "https://github.com/zarr-developers/cast-value.rs"
 readme = "../README.md"
 
+[features]
+default = []
+float16 = ["dep:half"]
+
 [dependencies]
+half = { version = "2", optional = true, features = ["num-traits"] }
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
