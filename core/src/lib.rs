@@ -919,49 +919,79 @@ mod float16_impls {
     // -- f16 → float targets --
     impl CastInto<f32> for f16 {
         #[inline]
-        fn dst_min() -> Self { f16::from_f32(f32::MIN) }
+        fn dst_min() -> Self {
+            f16::from_f32(f32::MIN)
+        }
         #[inline]
-        fn dst_max() -> Self { f16::from_f32(f32::MAX) }
+        fn dst_max() -> Self {
+            f16::from_f32(f32::MAX)
+        }
         #[inline]
-        fn cast_into(self) -> f32 { self.to_f32() }
+        fn cast_into(self) -> f32 {
+            self.to_f32()
+        }
     }
 
     impl CastInto<f64> for f16 {
         #[inline]
-        fn dst_min() -> Self { f16::from_f32(f64::MIN as f32) }
+        fn dst_min() -> Self {
+            f16::from_f32(f64::MIN as f32)
+        }
         #[inline]
-        fn dst_max() -> Self { f16::from_f32(f64::MAX as f32) }
+        fn dst_max() -> Self {
+            f16::from_f32(f64::MAX as f32)
+        }
         #[inline]
-        fn cast_into(self) -> f64 { self.to_f32() as f64 }
+        fn cast_into(self) -> f64 {
+            self.to_f32() as f64
+        }
     }
 
     // -- float → f16 targets --
     impl CastInto<f16> for f32 {
         #[inline]
-        fn dst_min() -> Self { f16::MIN.to_f32() }
+        fn dst_min() -> Self {
+            f16::MIN.to_f32()
+        }
         #[inline]
-        fn dst_max() -> Self { f16::MAX.to_f32() }
+        fn dst_max() -> Self {
+            f16::MAX.to_f32()
+        }
         #[inline]
-        fn cast_into(self) -> f16 { f16::from_f32(self) }
+        fn cast_into(self) -> f16 {
+            f16::from_f32(self)
+        }
     }
 
     impl CastInto<f16> for f64 {
         #[inline]
-        fn dst_min() -> Self { f16::MIN.to_f32() as f64 }
+        fn dst_min() -> Self {
+            f16::MIN.to_f32() as f64
+        }
         #[inline]
-        fn dst_max() -> Self { f16::MAX.to_f32() as f64 }
+        fn dst_max() -> Self {
+            f16::MAX.to_f32() as f64
+        }
         #[inline]
-        fn cast_into(self) -> f16 { f16::from_f32(self as f32) }
+        fn cast_into(self) -> f16 {
+            f16::from_f32(self as f32)
+        }
     }
 
     // -- f16 → f16 (identity) --
     impl CastInto<f16> for f16 {
         #[inline]
-        fn dst_min() -> Self { f16::MIN }
+        fn dst_min() -> Self {
+            f16::MIN
+        }
         #[inline]
-        fn dst_max() -> Self { f16::MAX }
+        fn dst_max() -> Self {
+            f16::MAX
+        }
         #[inline]
-        fn cast_into(self) -> f16 { self }
+        fn cast_into(self) -> f16 {
+            self
+        }
     }
 }
 
@@ -1425,7 +1455,10 @@ mod tests {
         #[test]
         fn test_f16_to_u8_basic() {
             let c = f2i_cfg::<f16, u8>(vec![], RoundingMode::NearestEven, None);
-            assert_eq!(convert_float_to_int(f16::from_f32(42.0), &c).unwrap(), 42_u8);
+            assert_eq!(
+                convert_float_to_int(f16::from_f32(42.0), &c).unwrap(),
+                42_u8
+            );
         }
 
         #[test]
@@ -1454,7 +1487,10 @@ mod tests {
         #[test]
         fn test_f16_scalar_map_nan() {
             let c = f2i_cfg::<f16, u8>(
-                vec![MapEntry { src: f16::NAN, tgt: 0_u8 }],
+                vec![MapEntry {
+                    src: f16::NAN,
+                    tgt: 0_u8,
+                }],
                 RoundingMode::NearestEven,
                 None,
             );
