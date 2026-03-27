@@ -3,6 +3,7 @@
 //! Exposes `cast_array` and `cast_array_into` to Python, dispatching on
 //! numpy dtype pairs to monomorphized conversion calls from the core crate.
 
+use half::f16;
 use numpy::{PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArray};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -10,6 +11,41 @@ use zarr_cast_value::{
     CastError, CastFloat, CastInt, CastInto, FloatToFloatConfig, FloatToIntConfig,
     IntToFloatConfig, IntToIntConfig, MapEntry, OutOfRangeMode, RoundingMode,
 };
+
+// ---------------------------------------------------------------------------
+// Extraction trait for scalar map values
+// ---------------------------------------------------------------------------
+
+/// Trait for extracting a typed value from a Python object.
+/// This exists because `half::f16` does not implement `pyo3::FromPyObject`.
+/// We implement it for each concrete numeric type used in dispatch.
+trait ExtractFromPy: Sized {
+    fn extract_from_py(ob: &Bound<'_, PyAny>) -> PyResult<Self>;
+}
+
+macro_rules! impl_extract_via_pyo3 {
+    ($($ty:ty),*) => {
+        $(
+            impl ExtractFromPy for $ty {
+                #[inline]
+                fn extract_from_py(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+                    ob.extract()
+                }
+            }
+        )*
+    };
+}
+
+impl_extract_via_pyo3!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
+
+/// f16: extract as f32, then convert. Python has no native float16.
+impl ExtractFromPy for f16 {
+    #[inline]
+    fn extract_from_py(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let val: f32 = ob.extract()?;
+        Ok(f16::from_f32(val))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // "Parse, don't validate" wrapper types for Python arguments
@@ -67,8 +103,8 @@ fn parse_map_entries<'py, Src, Dst>(
     entries: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Vec<MapEntry<Src, Dst>>>
 where
-    Src: zarr_cast_value::CastNum + for<'a> FromPyObject<'a>,
-    Dst: zarr_cast_value::CastNum + for<'a> FromPyObject<'a>,
+    Src: zarr_cast_value::CastNum + ExtractFromPy,
+    Dst: zarr_cast_value::CastNum + ExtractFromPy,
 {
     let Some(obj) = entries else {
         return Ok(Vec::new());
@@ -79,8 +115,8 @@ where
     if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut result = Vec::with_capacity(dict.len());
         for (key, val) in dict.iter() {
-            let src: Src = key.extract()?;
-            let tgt: Dst = val.extract()?;
+            let src: Src = Src::extract_from_py(&key)?;
+            let tgt: Dst = Dst::extract_from_py(&val)?;
             result.push(MapEntry { src, tgt });
         }
         return Ok(result);
@@ -107,8 +143,8 @@ where
                 "Each scalar_map entry must be a (source, target) pair",
             ));
         }
-        let src: Src = item.get_item(0)?.extract()?;
-        let tgt: Dst = item.get_item(1)?.extract()?;
+        let src: Src = Src::extract_from_py(&item.get_item(0)?)?;
+        let tgt: Dst = Dst::extract_from_py(&item.get_item(1)?)?;
         result.push(MapEntry { src, tgt });
     }
     Ok(result)
@@ -128,6 +164,7 @@ fn dtype_key(kind: char, itemsize: usize) -> PyResult<&'static str> {
         ('u', 2) => Ok("uint16"),
         ('u', 4) => Ok("uint32"),
         ('u', 8) => Ok("uint64"),
+        ('f', 2) => Ok("float16"),
         ('f', 4) => Ok("float32"),
         ('f', 8) => Ok("float64"),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -156,8 +193,8 @@ fn do_float_to_int_alloc<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastInt + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastInt + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -192,8 +229,8 @@ fn do_int_to_int_alloc<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastInt + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastInt + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastInt + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -227,8 +264,8 @@ fn do_float_to_float_alloc<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastFloat + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastFloat + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -262,8 +299,8 @@ fn do_int_to_float_alloc<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastInt + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastFloat + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastFloat + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -301,8 +338,8 @@ fn do_float_to_int_into<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastInt + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastInt + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -335,8 +372,8 @@ fn do_int_to_int_into<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastInt + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastInt + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastInt + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -369,8 +406,8 @@ fn do_float_to_float_into<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastFloat + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastFloat + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -403,8 +440,8 @@ fn do_int_to_float_into<'py, Src, Dst>(
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<PyObject>
 where
-    Src: CastInt + CastInto<Dst> + for<'a> FromPyObject<'a> + numpy::Element,
-    Dst: CastFloat + for<'a> FromPyObject<'a> + numpy::Element,
+    Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
+    Dst: CastFloat + ExtractFromPy + numpy::Element,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -478,6 +515,7 @@ fn dispatch_alloc<'py>(
                 "uint16" => int_to_int!($src_ty, u16),
                 "uint32" => int_to_int!($src_ty, u32),
                 "uint64" => int_to_int!($src_ty, u64),
+                "float16" => int_to_float!($src_ty, f16),
                 "float32" => int_to_float!($src_ty, f32),
                 "float64" => int_to_float!($src_ty, f64),
                 _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -498,6 +536,7 @@ fn dispatch_alloc<'py>(
                 "uint16" => float_to_int!($src_ty, u16),
                 "uint32" => float_to_int!($src_ty, u32),
                 "uint64" => float_to_int!($src_ty, u64),
+                "float16" => float_to_float!($src_ty, f16),
                 "float32" => float_to_float!($src_ty, f32),
                 "float64" => float_to_float!($src_ty, f64),
                 _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -516,6 +555,7 @@ fn dispatch_alloc<'py>(
         "uint16" => dispatch_int_src!(u16),
         "uint32" => dispatch_int_src!(u32),
         "uint64" => dispatch_int_src!(u64),
+        "float16" => dispatch_float_src!(f16),
         "float32" => dispatch_float_src!(f32),
         "float64" => dispatch_float_src!(f64),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -571,6 +611,7 @@ fn dispatch_into<'py>(
                 "uint16" => int_to_int!($src_ty, u16),
                 "uint32" => int_to_int!($src_ty, u32),
                 "uint64" => int_to_int!($src_ty, u64),
+                "float16" => int_to_float!($src_ty, f16),
                 "float32" => int_to_float!($src_ty, f32),
                 "float64" => int_to_float!($src_ty, f64),
                 _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -591,6 +632,7 @@ fn dispatch_into<'py>(
                 "uint16" => float_to_int!($src_ty, u16),
                 "uint32" => float_to_int!($src_ty, u32),
                 "uint64" => float_to_int!($src_ty, u64),
+                "float16" => float_to_float!($src_ty, f16),
                 "float32" => float_to_float!($src_ty, f32),
                 "float64" => float_to_float!($src_ty, f64),
                 _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -609,6 +651,7 @@ fn dispatch_into<'py>(
         "uint16" => dispatch_int_src!(u16),
         "uint32" => dispatch_int_src!(u32),
         "uint64" => dispatch_int_src!(u64),
+        "float16" => dispatch_float_src!(f16),
         "float32" => dispatch_float_src!(f32),
         "float64" => dispatch_float_src!(f64),
         _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(

@@ -829,6 +829,178 @@ impl_all_float_to_float!(f32 => f32, f64);
 impl_all_float_to_float!(f64 => f32, f64);
 
 // ---------------------------------------------------------------------------
+// float16 support (behind the "float16" feature flag)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "float16")]
+mod float16_impls {
+    use super::*;
+    use half::f16;
+
+    // ---- CastNum for f16 ----
+    impl CastNum for f16 {}
+
+    // ---- CastFloat for f16 ----
+    // f16 lacks native arithmetic, so all operations are performed by
+    // promoting to f32, computing there, and converting back. This is
+    // lossless for inputs that are representable as f16.
+    impl CastFloat for f16 {
+        #[inline]
+        fn round_with_mode(self, mode: RoundingMode) -> Self {
+            f16::from_f32(self.to_f32().round_with_mode(mode))
+        }
+        #[inline]
+        fn rem_euclid(self, rhs: Self) -> Self {
+            f16::from_f32(self.to_f32().rem_euclid(rhs.to_f32()))
+        }
+        #[inline]
+        fn next_up(self) -> Self {
+            // IEEE 754 nextUp implemented directly on f16 bits.
+            // Avoids round-tripping through f32 which could skip f16 values.
+            let bits = self.to_bits();
+            if self.is_nan() {
+                self
+            } else if bits == 0x8000 {
+                // -0.0 → smallest positive subnormal
+                f16::from_bits(0x0001)
+            } else if (bits & 0x8000) == 0 {
+                // Positive: increment bit pattern
+                f16::from_bits(bits + 1)
+            } else {
+                // Negative: decrement bit pattern (moves towards zero)
+                f16::from_bits(bits - 1)
+            }
+        }
+        #[inline]
+        fn next_down(self) -> Self {
+            // nextDown(x) = -nextUp(-x)
+            -(-self).next_up()
+        }
+    }
+
+    // ---- CastInto impls for f16 ----
+    // Cannot use the `as` cast macro since Rust has no `as f16` or `as T`
+    // from f16. All conversions go through f32.
+
+    // -- f16 → int targets --
+    macro_rules! impl_f16_to_int {
+        ($($dst:ty),*) => {
+            $(
+                impl CastInto<$dst> for f16 {
+                    #[inline]
+                    fn dst_min() -> Self { f16::from_f32(<$dst>::MIN as f32) }
+                    #[inline]
+                    fn dst_max() -> Self { f16::from_f32(<$dst>::MAX as f32) }
+                    #[inline]
+                    fn cast_into(self) -> $dst { self.to_f32() as $dst }
+                }
+            )*
+        };
+    }
+    impl_f16_to_int!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+    // -- int → f16 targets --
+    macro_rules! impl_int_to_f16 {
+        ($($src:ty),*) => {
+            $(
+                impl CastInto<f16> for $src {
+                    #[inline]
+                    fn dst_min() -> Self { 0 as $src } // unused — no range check
+                    #[inline]
+                    fn dst_max() -> Self { 0 as $src }
+                    #[inline]
+                    fn cast_into(self) -> f16 { f16::from_f32(self as f32) }
+                }
+            )*
+        };
+    }
+    impl_int_to_f16!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+    // -- f16 → float targets --
+    impl CastInto<f32> for f16 {
+        #[inline]
+        fn dst_min() -> Self {
+            f16::from_f32(f32::MIN)
+        }
+        #[inline]
+        fn dst_max() -> Self {
+            f16::from_f32(f32::MAX)
+        }
+        #[inline]
+        fn cast_into(self) -> f32 {
+            self.to_f32()
+        }
+    }
+
+    impl CastInto<f64> for f16 {
+        #[inline]
+        fn dst_min() -> Self {
+            f16::from_f32(f64::MIN as f32)
+        }
+        #[inline]
+        fn dst_max() -> Self {
+            f16::from_f32(f64::MAX as f32)
+        }
+        #[inline]
+        fn cast_into(self) -> f64 {
+            self.to_f32() as f64
+        }
+    }
+
+    // -- float → f16 targets --
+    impl CastInto<f16> for f32 {
+        #[inline]
+        fn dst_min() -> Self {
+            f16::MIN.to_f32()
+        }
+        #[inline]
+        fn dst_max() -> Self {
+            f16::MAX.to_f32()
+        }
+        #[inline]
+        fn cast_into(self) -> f16 {
+            f16::from_f32(self)
+        }
+    }
+
+    impl CastInto<f16> for f64 {
+        #[inline]
+        fn dst_min() -> Self {
+            f16::MIN.to_f32() as f64
+        }
+        #[inline]
+        fn dst_max() -> Self {
+            f16::MAX.to_f32() as f64
+        }
+        #[inline]
+        fn cast_into(self) -> f16 {
+            f16::from_f32(self as f32)
+        }
+    }
+
+    // -- f16 → f16 (identity) --
+    impl CastInto<f16> for f16 {
+        #[inline]
+        fn dst_min() -> Self {
+            f16::MIN
+        }
+        #[inline]
+        fn dst_max() -> Self {
+            f16::MAX
+        }
+        #[inline]
+        fn cast_into(self) -> f16 {
+            self
+        }
+    }
+}
+
+// Re-export f16 when the feature is enabled so consumers can use it
+// through this crate without depending on `half` directly.
+#[cfg(feature = "float16")]
+pub use half::f16;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1271,5 +1443,142 @@ mod tests {
             to_f64_lossy(result_tz) <= val as f64,
             "towards-zero: {result_tz} > {val}"
         );
+    }
+
+    // ---- float16 tests ----
+
+    #[cfg(feature = "float16")]
+    mod float16_tests {
+        use super::*;
+        use half::f16;
+
+        #[test]
+        fn test_f16_to_u8_basic() {
+            let c = f2i_cfg::<f16, u8>(vec![], RoundingMode::NearestEven, None);
+            assert_eq!(
+                convert_float_to_int(f16::from_f32(42.0), &c).unwrap(),
+                42_u8
+            );
+        }
+
+        #[test]
+        fn test_f16_to_u8_clamp() {
+            let c = f2i_cfg::<f16, u8>(
+                vec![],
+                RoundingMode::NearestEven,
+                Some(OutOfRangeMode::Clamp),
+            );
+            assert_eq!(
+                convert_float_to_int(f16::from_f32(300.0), &c).unwrap(),
+                255_u8
+            );
+            assert_eq!(
+                convert_float_to_int(f16::from_f32(-10.0), &c).unwrap(),
+                0_u8
+            );
+        }
+
+        #[test]
+        fn test_f16_nan_error() {
+            let c = f2i_cfg::<f16, u8>(vec![], RoundingMode::NearestEven, None);
+            assert!(convert_float_to_int(f16::NAN, &c).is_err());
+        }
+
+        #[test]
+        fn test_f16_scalar_map_nan() {
+            let c = f2i_cfg::<f16, u8>(
+                vec![MapEntry {
+                    src: f16::NAN,
+                    tgt: 0_u8,
+                }],
+                RoundingMode::NearestEven,
+                None,
+            );
+            assert_eq!(convert_float_to_int(f16::NAN, &c).unwrap(), 0_u8);
+        }
+
+        #[test]
+        fn test_f32_to_f16_basic() {
+            let c = FloatToFloatConfig {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: None,
+            };
+            let result: f16 = convert_float_to_float(1.5_f32, &c).unwrap();
+            assert_eq!(result, f16::from_f32(1.5));
+        }
+
+        #[test]
+        fn test_f64_to_f16_overflow_clamp() {
+            let c = FloatToFloatConfig {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: Some(OutOfRangeMode::Clamp),
+            };
+            let result: f16 = convert_float_to_float(1.0e10_f64, &c).unwrap();
+            assert!(result.is_infinite());
+        }
+
+        #[test]
+        fn test_f16_to_f32_lossless() {
+            let c = FloatToFloatConfig {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: None,
+            };
+            let val = f16::from_f32(1.5);
+            let result: f32 = convert_float_to_float(val, &c).unwrap();
+            assert_eq!(result, 1.5_f32);
+        }
+
+        #[test]
+        fn test_f16_nan_propagates() {
+            let c = FloatToFloatConfig {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: None,
+            };
+            let result: f32 = convert_float_to_float(f16::NAN, &c).unwrap();
+            assert!(result.is_nan());
+        }
+
+        #[test]
+        fn test_i32_to_f16() {
+            let c = IntToFloatConfig {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+            };
+            let result: f16 = convert_int_to_float(42_i32, &c).unwrap();
+            assert_eq!(result, f16::from_f32(42.0));
+        }
+
+        #[test]
+        fn test_f16_to_i32() {
+            let c = f2i_cfg::<f16, i32>(vec![], RoundingMode::NearestEven, None);
+            assert_eq!(
+                convert_float_to_int(f16::from_f32(-7.0), &c).unwrap(),
+                -7_i32
+            );
+        }
+
+        #[test]
+        fn test_f16_slice_conversion() {
+            let src = [f16::from_f32(1.0), f16::from_f32(2.0), f16::from_f32(3.0)];
+            let mut dst = [0_u8; 3];
+            let c = f2i_cfg::<f16, u8>(vec![], RoundingMode::NearestEven, None);
+            convert_slice_float_to_int(&src, &mut dst, &c).unwrap();
+            assert_eq!(dst, [1, 2, 3]);
+        }
+
+        #[test]
+        fn test_f16_next_up_next_down() {
+            let one = f16::from_f32(1.0);
+            let up = one.next_up();
+            let down = one.next_down();
+            assert!(up > one);
+            assert!(down < one);
+            assert_eq!(up.next_down(), one);
+            assert_eq!(down.next_up(), one);
+        }
     }
 }
