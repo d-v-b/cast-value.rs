@@ -17,6 +17,9 @@ use crate::RoundingMode;
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 
+#[cfg(target_arch = "x86_64")]
+mod avx;
+
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 
@@ -84,7 +87,12 @@ fn dispatch_f64_to_u8(
         // SAFETY: V3 guarantees AVX2 + SSE4.1 are available.
         return unsafe { avx2::f64_to_u8_clamp(simd, src, dst, rounding) }.map(|()| true);
     }
-    // Fall back to the generic WithSimd kernel (may use SSE on older x86_64).
+    // Check for AVX1 (without AVX2)
+    if is_x86_feature_detected!("avx") {
+        // SAFETY: Runtime check confirmed AVX is available.
+        return unsafe { avx::f64_to_u8_clamp(src, dst, rounding) }.map(|()| true);
+    }
+    // Fall back to the generic WithSimd kernel (scalar on this CPU).
     generic::f64_to_u8_clamp(src, dst, rounding)
 }
 
@@ -116,6 +124,9 @@ fn dispatch_f64_to_i32(
     if let pulp::x86::Arch::V3(simd) = pulp::x86::Arch::new() {
         return unsafe { avx2::f64_to_i32_clamp(simd, src, dst, rounding) }.map(|()| true);
     }
+    if is_x86_feature_detected!("avx") {
+        return unsafe { avx::f64_to_i32_clamp(src, dst, rounding) }.map(|()| true);
+    }
     generic::f64_to_i32_clamp(src, dst, rounding)
 }
 
@@ -145,6 +156,9 @@ fn dispatch_f32_to_u8(
 ) -> Result<bool, crate::CastError> {
     if let pulp::x86::Arch::V3(simd) = pulp::x86::Arch::new() {
         return unsafe { avx2::f32_to_u8_clamp(simd, src, dst, rounding) }.map(|()| true);
+    }
+    if is_x86_feature_detected!("avx") {
+        return unsafe { avx::f32_to_u8_clamp(src, dst, rounding) }.map(|()| true);
     }
     generic::f32_to_u8_clamp(src, dst, rounding)
 }
