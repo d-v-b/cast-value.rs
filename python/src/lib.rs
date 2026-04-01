@@ -297,8 +297,8 @@ fn do_float_to_float_alloc<'py, Src, Dst>(
     tgt_dtype: &str,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
-    Dst: CastFloat + ExtractFromPy + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
+    Dst: CastFloat + ExtractFromPy + numpy::Element + 'static,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
@@ -447,8 +447,8 @@ fn do_float_to_float_into<'py, Src, Dst>(
     tgt_dtype: &str,
 ) -> PyResult<PyObject>
 where
-    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element,
-    Dst: CastFloat + ExtractFromPy + numpy::Element,
+    Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
+    Dst: CastFloat + ExtractFromPy + numpy::Element + 'static,
 {
     let input_arr: PyReadonlyArrayDyn<'_, Src> = arr.extract()?;
     let src_slice = input_arr
