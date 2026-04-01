@@ -4,7 +4,9 @@
 //! numpy dtype pairs to monomorphized conversion calls from the core crate.
 
 use half::f16;
-use numpy::{PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArray, PyUntypedArrayMethods};
+use numpy::{
+    PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArray, PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use zarr_cast_value::{
