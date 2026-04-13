@@ -1,4 +1,4 @@
 [workspace]
-members = ["core", "python"]
+members = ["core", "python", "js"]
 default-members = ["core"]
 resolver = "2"
