@@ -255,6 +255,8 @@ const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 /// # Errors
 ///
 /// Returns `CastError::FloatOutOfRange` unless `out_of_range` is `clamp`.
+#[cold]
+#[inline(never)]
 fn float_overflow<Dst: CastFloat>(
     negative: bool,
     value: f64,
@@ -288,26 +290,33 @@ fn mantissa_digits<F: CastFloat>() -> u32 {
     (1 - exponent) as u32
 }
 
-/// Round an integer to `mantissa_digits` significant bits with the given
-/// rounding mode, returning the exact rounded value as `f64`.
-///
-/// The rounding happens on the integer's bits, so it is a single rounding
-/// even for `i64`/`u64` values that `f64` cannot hold exactly. The result has
-/// at most `mantissa_digits` (≤ 53) significant bits and a magnitude of at
-/// most 2^64, so it is exact in `f64`.
-fn round_int_to_precision<Src: CastInt>(
-    val: Src,
-    mantissa_digits: u32,
-    rounding: RoundingMode,
-) -> f64 {
-    let (magnitude, negative) = match val.to_i64() {
+/// The magnitude and sign of an integer, exact for every `CastInt` type.
+#[inline]
+fn int_magnitude<Src: CastInt>(val: Src) -> (u64, bool) {
+    match val.to_i64() {
         Some(v) => (v.unsigned_abs(), v < 0),
         None => (
             val.to_u64()
                 .expect("an integer outside the i64 range is a u64"),
             false,
         ),
-    };
+    }
+}
+
+/// Round an integer (given as `magnitude` and sign) to `mantissa_digits`
+/// significant bits with the given rounding mode, returning the exact rounded
+/// value as `f64`.
+///
+/// The rounding happens on the integer's bits, so it is a single rounding
+/// even for `i64`/`u64` values that `f64` cannot hold exactly. The result has
+/// at most `mantissa_digits` (≤ 53) significant bits and a magnitude of at
+/// most 2^64, so it is exact in `f64`.
+fn round_int_to_precision(
+    magnitude: u64,
+    negative: bool,
+    mantissa_digits: u32,
+    rounding: RoundingMode,
+) -> f64 {
     let significant_bits = u64::BITS - magnitude.leading_zeros();
     let rounded = if significant_bits <= mantissa_digits {
         magnitude as f64
@@ -538,6 +547,22 @@ where
     Src: CastFloat + CastInto<Dst>,
     Dst: CastFloat,
 {
+    float_to_float_with_rounding(val, config, config.rounding)
+}
+
+/// [`convert_float_to_float`] with the rounding mode passed separately, so the slice
+/// function can pass a constant per mode and let the per-element mode checks
+/// fold away.
+#[inline(always)]
+fn float_to_float_with_rounding<Src, Dst>(
+    val: Src,
+    config: &FloatToFloatConfig<Src, Dst>,
+    rounding: RoundingMode,
+) -> Result<Dst, CastError>
+where
+    Src: CastFloat + CastInto<Dst>,
+    Dst: CastFloat,
+{
     // Step 1: scalar_map lookup
     if !config.map_entries.is_empty() {
         if let Some(tgt) = apply_scalar_map_float(val, &config.map_entries) {
@@ -555,76 +580,104 @@ where
     // exactly, so comparing in f64 detects inexactness exactly.
     let val_f64 = to_f64_lossy(val);
     let nearest_f64 = to_f64_lossy(nearest);
-    let result =
-        if val.is_nan() || config.rounding == RoundingMode::NearestEven || val_f64 == nearest_f64 {
-            nearest
-        } else {
-            match config.rounding {
-                RoundingMode::NearestEven => nearest, // unreachable, but keep exhaustive
-                RoundingMode::TowardsZero => {
-                    // Need the value closer to zero
-                    if nearest_f64.abs() > val_f64.abs() {
-                        if val_f64 >= 0.0 {
-                            nearest.next_down()
-                        } else {
-                            nearest.next_up()
-                        }
-                    } else {
-                        nearest
-                    }
-                }
-                RoundingMode::TowardsPositive => {
-                    // Need the value >= original
-                    if nearest_f64 < val_f64 {
-                        nearest.next_up()
-                    } else {
-                        nearest
-                    }
-                }
-                RoundingMode::TowardsNegative => {
-                    // Need the value <= original
-                    if nearest_f64 > val_f64 {
-                        nearest.next_down()
-                    } else {
-                        nearest
-                    }
-                }
-                RoundingMode::NearestAway => {
-                    // Nearest, ties away from zero. The `as` cast already gave
-                    // us nearest-even. We only need to adjust on ties where
-                    // nearest-even went towards zero but nearest-away should
-                    // go away from zero. Check if the midpoint between the result
-                    // and the adjacent value equals the original.
-                    let candidate = if val_f64 > nearest_f64 {
-                        nearest.next_up()
-                    } else {
-                        nearest.next_down()
-                    };
-                    let mid = (nearest_f64 + to_f64_lossy(candidate)) / 2.0;
-                    if mid == val_f64 && candidate.abs() > nearest.abs() {
-                        candidate // a tie: pick the one farther from zero
-                    } else {
-                        nearest // not a tie, nearest-even already correct
-                    }
-                }
-            }
-        };
+    if rounding == RoundingMode::NearestEven || val_f64 == nearest_f64 {
+        // Exact or nearest-even: the only possible overflow is a finite value
+        // that nearest-even rounded to ±Inf.
+        if nearest.is_infinite() && val.is_finite() {
+            return float_overflow(val_f64 < 0.0, val_f64, config.out_of_range);
+        }
+        return Ok(nearest);
+    }
 
-    // Step 5: out-of-range check on the rounded value. A finite source
-    // overflows when its result is ±Inf, or when nearest-even overflowed and
-    // a towards-zero adjustment stepped back to ±MAX: with an unbounded
-    // exponent, that adjustment only lands on MAX while |val| < MAX + ulp(MAX)
-    // = 2^(emax + 1). (Only narrowing casts reach the threshold, so its
-    // computation never overflows f64.)
-    let overflowed = val.is_finite()
-        && (result.is_infinite()
-            || (nearest.is_infinite() && {
-                let max = to_f64_lossy(Dst::max_value());
-                let ulp_of_max = max - to_f64_lossy(Dst::max_value().next_down());
-                val_f64.abs() >= max + ulp_of_max
-            }));
+    // Inexact with a directed or nearest-away mode, or NaN (NaN != NaN). ±Inf
+    // converts exactly, so `val` is finite or NaN; every comparison below is
+    // false for NaN, which therefore passes through unchanged.
+    let result = match rounding {
+        RoundingMode::NearestEven => nearest, // unreachable, but keep exhaustive
+        RoundingMode::TowardsZero => {
+            // Need the value closer to zero
+            if nearest_f64.abs() > val_f64.abs() {
+                if val_f64 >= 0.0 {
+                    nearest.next_down()
+                } else {
+                    nearest.next_up()
+                }
+            } else {
+                nearest
+            }
+        }
+        RoundingMode::TowardsPositive => {
+            // Need the value >= original
+            if nearest_f64 < val_f64 {
+                nearest.next_up()
+            } else {
+                nearest
+            }
+        }
+        RoundingMode::TowardsNegative => {
+            // Need the value <= original
+            if nearest_f64 > val_f64 {
+                nearest.next_down()
+            } else {
+                nearest
+            }
+        }
+        RoundingMode::NearestAway => {
+            // Nearest, ties away from zero. The `as` cast already gave
+            // us nearest-even. We only need to adjust on ties where
+            // nearest-even went towards zero but nearest-away should
+            // go away from zero. Check if the midpoint between the result
+            // and the adjacent value equals the original.
+            let candidate = if val_f64 > nearest_f64 {
+                nearest.next_up()
+            } else {
+                nearest.next_down()
+            };
+            let mid = (nearest_f64 + to_f64_lossy(candidate)) / 2.0;
+            if mid == val_f64 && candidate.abs() > nearest.abs() {
+                candidate // a tie: pick the one farther from zero
+            } else {
+                nearest // not a tie, nearest-even already correct
+            }
+        }
+    };
+
+    // Step 5: out-of-range check on the rounded value. Overflow needs the
+    // result or the nearest-even value to be ±Inf; `|` (not `||`) keeps this
+    // hot test branch-free, and the exact decision is made off the hot path.
+    if result.is_infinite() | nearest.is_infinite() {
+        return directed_overflow_check(val_f64, nearest, result, config.out_of_range);
+    }
+    Ok(result)
+}
+
+/// Decide whether an inexact float→float result that is, or came from, ±Inf
+/// overflowed, and handle it per `out_of_range`.
+///
+/// It overflows when the result is ±Inf, or when nearest-even overflowed and
+/// a towards-zero adjustment stepped back to ±MAX: with an unbounded exponent,
+/// that adjustment only lands on MAX while |val| < MAX + ulp(MAX) =
+/// 2^(emax + 1). (Only narrowing casts get here, so the threshold never
+/// overflows f64.)
+///
+/// # Errors
+///
+/// Returns `CastError::FloatOutOfRange` on overflow unless `out_of_range` is
+/// `clamp`.
+#[cold]
+#[inline(never)]
+fn directed_overflow_check<Dst: CastFloat>(
+    val_f64: f64,
+    nearest: Dst,
+    result: Dst,
+    out_of_range: Option<OutOfRangeMode>,
+) -> Result<Dst, CastError> {
+    let max = to_f64_lossy(Dst::max_value());
+    let ulp_of_max = max - to_f64_lossy(Dst::max_value().next_down());
+    let overflowed =
+        result.is_infinite() || (nearest.is_infinite() && val_f64.abs() >= max + ulp_of_max);
     if overflowed {
-        return float_overflow(val_f64 < 0.0, val_f64, config.out_of_range);
+        return float_overflow(val_f64 < 0.0, val_f64, out_of_range);
     }
     Ok(result)
 }
@@ -652,6 +705,22 @@ where
     Src: CastInt + CastInto<Dst>,
     Dst: CastFloat,
 {
+    int_to_float_with_rounding(val, config, config.rounding)
+}
+
+/// [`convert_int_to_float`] with the rounding mode passed separately, so the slice
+/// function can pass a constant per mode and let the per-element mode checks
+/// fold away.
+#[inline(always)]
+fn int_to_float_with_rounding<Src, Dst>(
+    val: Src,
+    config: &IntToFloatConfig<Src, Dst>,
+    rounding: RoundingMode,
+) -> Result<Dst, CastError>
+where
+    Src: CastInt + CastInto<Dst>,
+    Dst: CastFloat,
+{
     // Step 1: scalar_map lookup
     if !config.map_entries.is_empty() {
         if let Some(tgt) = apply_scalar_map_int(val, &config.map_entries) {
@@ -660,11 +729,18 @@ where
     }
 
     // Step 2: round. Rust's `as` rounds integers to the nearest float, ties to
-    // even; other modes round the integer's bits directly.
-    let result = if config.rounding == RoundingMode::NearestEven {
-        val.cast_into()
+    // even, and is exact (so right in every mode) when the bits from the
+    // highest to the lowest set bit fit in the target's significand. Only the
+    // remaining values are rounded on the integer's bits.
+    let nearest = val.cast_into();
+    let (magnitude, negative) = int_magnitude(val);
+    let digits = mantissa_digits::<Dst>();
+    let significant_span =
+        (u64::BITS - magnitude.leading_zeros()).saturating_sub(magnitude.trailing_zeros());
+    let result = if rounding == RoundingMode::NearestEven || significant_span <= digits {
+        nearest
     } else {
-        let rounded = round_int_to_precision(val, mantissa_digits::<Dst>(), config.rounding);
+        let rounded = round_int_to_precision(magnitude, negative, digits, rounding);
         if rounded.abs() > to_f64_lossy(Dst::max_value()) {
             Dst::infinity() // overflow marker, handled below
         } else {
@@ -675,7 +751,9 @@ where
     };
 
     // Step 3: an integer is always finite, so an infinite result is overflow.
-    if result.is_infinite() {
+    // Only targets whose finite range ends below 2^64 (f16) can overflow; the
+    // range test is a constant, so wide targets skip the check entirely.
+    if to_f64_lossy(Dst::max_value()) < TWO_POW_64 && result.is_infinite() {
         let val_f64 = to_f64_lossy(val);
         return float_overflow(val_f64 < 0.0, val_f64, config.out_of_range);
     }
@@ -853,9 +931,21 @@ where
         }
     }
 
-    // Scalar fallback
-    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
-        *out_slot = convert_float_to_float(*in_val, config)?;
+    // Dispatch on the rounding mode once, outside the loop: each arm passes a
+    // constant, so the per-element mode checks fold away.
+    macro_rules! convert_with {
+        ($mode:expr) => {
+            for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+                *out_slot = float_to_float_with_rounding(*in_val, config, $mode)?;
+            }
+        };
+    }
+    match config.rounding {
+        RoundingMode::NearestEven => convert_with!(RoundingMode::NearestEven),
+        RoundingMode::TowardsZero => convert_with!(RoundingMode::TowardsZero),
+        RoundingMode::TowardsPositive => convert_with!(RoundingMode::TowardsPositive),
+        RoundingMode::TowardsNegative => convert_with!(RoundingMode::TowardsNegative),
+        RoundingMode::NearestAway => convert_with!(RoundingMode::NearestAway),
     }
     Ok(())
 }
@@ -881,8 +971,21 @@ where
             dst_len: dst.len(),
         });
     }
-    for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
-        *out_slot = convert_int_to_float(*in_val, config)?;
+    // Dispatch on the rounding mode once, outside the loop: each arm passes a
+    // constant, so the per-element mode checks fold away.
+    macro_rules! convert_with {
+        ($mode:expr) => {
+            for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
+                *out_slot = int_to_float_with_rounding(*in_val, config, $mode)?;
+            }
+        };
+    }
+    match config.rounding {
+        RoundingMode::NearestEven => convert_with!(RoundingMode::NearestEven),
+        RoundingMode::TowardsZero => convert_with!(RoundingMode::TowardsZero),
+        RoundingMode::TowardsPositive => convert_with!(RoundingMode::TowardsPositive),
+        RoundingMode::TowardsNegative => convert_with!(RoundingMode::TowardsNegative),
+        RoundingMode::NearestAway => convert_with!(RoundingMode::NearestAway),
     }
     Ok(())
 }
