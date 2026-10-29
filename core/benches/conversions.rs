@@ -374,6 +374,7 @@ fn bench_i64_to_f32(c: &mut Criterion) {
         let config = IntToFloatConfig {
             map_entries: vec![],
             rounding: RoundingMode::NearestEven,
+            out_of_range: None,
         };
         group.bench_with_input(
             BenchmarkId::new("i64_to_f32/nearest_even", n),
@@ -394,6 +395,7 @@ fn bench_i64_to_f32(c: &mut Criterion) {
         let config_tz = IntToFloatConfig {
             map_entries: vec![],
             rounding: RoundingMode::TowardsZero,
+            out_of_range: None,
         };
         group.bench_with_input(
             BenchmarkId::new("i64_to_f32/towards_zero", n),

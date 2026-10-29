@@ -38,7 +38,7 @@ Each conversion path has its own config struct:
 - `FloatToIntConfig` -- rounding mode, out-of-range mode, scalar map entries
 - `IntToIntConfig` -- out-of-range mode, scalar map entries
 - `FloatToFloatConfig` -- rounding mode, out-of-range mode, scalar map entries
-- `IntToFloatConfig` -- rounding mode, scalar map entries
+- `IntToFloatConfig` -- rounding mode, out-of-range mode, scalar map entries
 
 ### Types and traits
 

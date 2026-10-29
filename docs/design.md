@@ -40,10 +40,10 @@ are called:
 
 | Path | Pipeline |
 |---|---|
-| float to int | scalar_map, reject NaN, round, range check/clamp/wrap, cast |
+| float to int | scalar_map, reject NaN/Inf, round, range check/clamp/wrap, cast |
 | int to int | scalar_map, range check/clamp/wrap, cast |
 | float to float | scalar_map, NaN/Inf propagation, cast, rounding adjustment, overflow check |
-| int to float | scalar_map, cast, rounding adjustment |
+| int to float | scalar_map, round to target precision, overflow check |
 
 Each path exists at two levels:
 

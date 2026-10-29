@@ -22,7 +22,7 @@
 //!
 //! Rounding is done per-lane because the [`pulp::Simd`] trait intentionally omits
 //! `floor`/`ceil`/`trunc` (no universal SIMD encoding). This doesn't prevent
-//! vectorization of other operations like NaN detection, clamping, and load/store.
+//! vectorization of other operations like NaN/Inf detection, clamping, and load/store.
 
 use crate::RoundingMode;
 use pulp::{Simd, WithSimd};
@@ -77,17 +77,19 @@ impl WithSimd for F64ToU8ClampKernel<'_> {
 
         let mut i = 0;
         while i < n {
-            // Load up to `lanes` elements; tail is zero-padded (0.0 is never NaN).
+            // Load up to `lanes` elements; tail is zero-padded (0.0 is finite).
             let chunk = &src[i..n.min(i + lanes)];
             let x = simd.partial_load_f64s(chunk);
 
-            // NaN detection: IEEE 754 defines NaN != NaN, so equal_f64s(NaN, NaN)
-            // returns all-zeros. not_m64s inverts this: NaN lanes become all-ones.
+            // NaN/Inf detection: `x - x` is NaN exactly when x is NaN or ±Inf, and
+            // IEEE 754 defines NaN != NaN, so equal_f64s(d, d) is all-zeros there.
+            // not_m64s inverts this: non-finite lanes become all-ones.
             // first_true_m64s returns S::F64_LANES when no lane is true.
-            let nan_mask = simd.not_m64s(simd.equal_f64s(x, x));
-            if simd.first_true_m64s(nan_mask) < lanes {
+            let d = simd.sub_f64s(x, x);
+            let non_finite = simd.not_m64s(simd.equal_f64s(d, d));
+            if simd.first_true_m64s(non_finite) < lanes {
                 for &val in chunk {
-                    if val.is_nan() {
+                    if !val.is_finite() {
                         return Err(crate::CastError::NanOrInf { value: val });
                     }
                 }
@@ -153,10 +155,11 @@ impl WithSimd for F64ToI32ClampKernel<'_> {
             let chunk = &src[i..n.min(i + lanes)];
             let x = simd.partial_load_f64s(chunk);
 
-            let nan_mask = simd.not_m64s(simd.equal_f64s(x, x));
-            if simd.first_true_m64s(nan_mask) < lanes {
+            let d = simd.sub_f64s(x, x);
+            let non_finite = simd.not_m64s(simd.equal_f64s(d, d));
+            if simd.first_true_m64s(non_finite) < lanes {
                 for &val in chunk {
-                    if val.is_nan() {
+                    if !val.is_finite() {
                         return Err(crate::CastError::NanOrInf { value: val });
                     }
                 }
@@ -218,10 +221,11 @@ impl WithSimd for F32ToU8ClampKernel<'_> {
             let chunk = &src[i..n.min(i + lanes)];
             let x = simd.partial_load_f32s(chunk);
 
-            let nan_mask = simd.not_m32s(simd.equal_f32s(x, x));
-            if simd.first_true_m32s(nan_mask) < lanes {
+            let d = simd.sub_f32s(x, x);
+            let non_finite = simd.not_m32s(simd.equal_f32s(d, d));
+            if simd.first_true_m32s(non_finite) < lanes {
                 for &val in chunk {
-                    if val.is_nan() {
+                    if !val.is_finite() {
                         return Err(crate::CastError::NanOrInf { value: val as f64 });
                     }
                 }

@@ -90,16 +90,6 @@ FLOAT_TO_INT_CASES = [
     ),
     Expect(
         input=dict(
-            arr=np.array([inf, -inf], dtype=np.float64),
-            target_dtype="uint8",
-            rounding_mode="nearest-even",
-            out_of_range_mode="clamp",
-        ),
-        expected=np.array([255, 0], dtype=np.uint8),
-        id="inf-clamp",
-    ),
-    Expect(
-        input=dict(
             arr=np.array([1.0, 2.0, 3.0], dtype=np.float32),
             target_dtype="int16",
             rounding_mode="nearest-even",
@@ -148,6 +138,17 @@ FLOAT_TO_INT_FAIL_CASES = [
         ),
         exception=ValueError, match="cast",
         id="inf-wrap",
+    ),
+    # Integers cannot represent ±Inf, so even clamp must fail (spec).
+    ExpectFail(
+        input=dict(
+            arr=np.array([inf], dtype=np.float64),
+            target_dtype="uint8",
+            rounding_mode="nearest-even",
+            out_of_range_mode="clamp",
+        ),
+        exception=ValueError, match="cast",
+        id="inf-clamp",
     ),
 ]
 
@@ -339,7 +340,27 @@ INT_TO_FLOAT_CASES = [
         expected=np.array([0.0, -1.0, 32767.0, -32768.0], dtype=np.float64),
         id="lossless-widening",
     ),
+    Expect(
+        input=dict(
+            arr=np.array([70000, -70000], dtype=np.int32),
+            target_dtype="float16",
+            rounding_mode="nearest-even",
+            out_of_range_mode="clamp",
+        ),
+        expected=np.array([inf, -inf], dtype=np.float16),
+        id="float16-overflow-clamp",
+    ),
 ]
+
+
+def test_int_to_float16_overflow_error():
+    """Integers beyond float16's finite range fail without out_of_range."""
+    with pytest.raises(ValueError, match="out of range"):
+        cast_array(
+            np.array([70000], dtype=np.int32),
+            target_dtype="float16",
+            rounding_mode="nearest-even",
+        )
 
 
 @pytest.mark.parametrize(

@@ -40,19 +40,22 @@ unsafe fn round_f32x4(v: v128, mode: RoundingMode) -> v128 {
     }
 }
 
-/// Return `true` if any lane in a f64x2 vector is NaN.
+/// Return `true` if any lane in a f64x2 vector is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f64x2(v: v128) -> bool {
+unsafe fn any_non_finite_f64x2(v: v128) -> bool {
+    // `v - v` is NaN exactly in the lanes where `v` is NaN or ±Inf.
     // f64x2_eq returns all-ones for non-NaN, all-zeros for NaN
-    let eq = f64x2_eq(v, v);
-    // Extract lanes and check if any is zero (NaN)
+    let d = f64x2_sub(v, v);
+    let eq = f64x2_eq(d, d);
+    // Extract lanes and check if any is zero (non-finite)
     u64x2_extract_lane::<0>(eq) == 0 || u64x2_extract_lane::<1>(eq) == 0
 }
 
-/// Return `true` if any lane in a f32x4 vector is NaN.
+/// Return `true` if any lane in a f32x4 vector is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f32x4(v: v128) -> bool {
-    let eq = f32x4_eq(v, v);
+unsafe fn any_non_finite_f32x4(v: v128) -> bool {
+    let d = f32x4_sub(v, v);
+    let eq = f32x4_eq(d, d);
     u32x4_extract_lane::<0>(eq) == 0
         || u32x4_extract_lane::<1>(eq) == 0
         || u32x4_extract_lane::<2>(eq) == 0
@@ -80,10 +83,10 @@ pub(super) unsafe fn f64_to_u8_clamp(
     while i + 2 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f64x2(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f64x2(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 2] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -110,7 +113,7 @@ pub(super) unsafe fn f64_to_u8_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
@@ -147,10 +150,10 @@ pub(super) unsafe fn f64_to_i32_clamp(
     while i + 2 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f64x2(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f64x2(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 2] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -177,7 +180,7 @@ pub(super) unsafe fn f64_to_i32_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
@@ -264,9 +267,9 @@ pub(super) unsafe fn f64_to_i32_check(
     while i + 2 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f64x2(v) {
+        if any_non_finite_f64x2(v) {
             for &val in &src[i..i + 2] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -302,7 +305,7 @@ pub(super) unsafe fn f64_to_i32_check(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
@@ -346,10 +349,10 @@ pub(super) unsafe fn f32_to_u8_clamp(
     while i + 4 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f32x4(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f32x4(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 4] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val as f64 });
                 }
             }
@@ -378,7 +381,7 @@ pub(super) unsafe fn f32_to_u8_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val as f64 });
         }
         let rounded = match rounding {

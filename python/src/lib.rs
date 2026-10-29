@@ -376,6 +376,7 @@ fn do_int_to_float_alloc<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
     rounding: RoundingMode,
+    oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyAny>>,
     src_dtype: &str,
     tgt_dtype: &str,
@@ -389,6 +390,7 @@ where
     let config = IntToFloatConfig {
         map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
         rounding,
+        out_of_range: oor,
     };
     let shape: Vec<usize> = arr.shape().to_vec();
     let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
@@ -535,6 +537,7 @@ fn do_int_to_float_into<'py, Src, Dst>(
     arr: &Bound<'py, PyUntypedArray>,
     out: &Bound<'py, PyUntypedArray>,
     rounding: RoundingMode,
+    oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyAny>>,
     src_dtype: &str,
     tgt_dtype: &str,
@@ -548,6 +551,7 @@ where
     let config = IntToFloatConfig {
         map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
         rounding,
+        out_of_range: oor,
     };
     let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.cast()?;
     // Zero-size arrays skip the conversion: there is nothing to convert, and
@@ -629,6 +633,7 @@ fn dispatch_alloc<'py>(
                 py,
                 arr,
                 rounding,
+                oor,
                 map_entries_py,
                 src_dtype,
                 tgt_dtype,
@@ -760,6 +765,7 @@ fn dispatch_into<'py>(
                 arr,
                 out,
                 rounding,
+                oor,
                 map_entries_py,
                 src_dtype,
                 tgt_dtype,

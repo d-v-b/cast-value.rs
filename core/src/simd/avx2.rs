@@ -60,16 +60,17 @@ pub(super) unsafe fn f64_to_u8_clamp(
         let v2 = _mm256_loadu_pd(ptr.add(8));
         let v3 = _mm256_loadu_pd(ptr.add(12));
 
-        // Inline NaN check: OR all unordered comparison masks
-        let nan0 = _mm256_cmp_pd(v0, v0, _CMP_UNORD_Q);
-        let nan1 = _mm256_cmp_pd(v1, v1, _CMP_UNORD_Q);
-        let nan2 = _mm256_cmp_pd(v2, v2, _CMP_UNORD_Q);
-        let nan3 = _mm256_cmp_pd(v3, v3, _CMP_UNORD_Q);
+        // Inline NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf):
+        // OR all unordered comparison masks
+        let nan0 = _mm256_cmp_pd(_mm256_sub_pd(v0, v0), _mm256_setzero_pd(), _CMP_UNORD_Q);
+        let nan1 = _mm256_cmp_pd(_mm256_sub_pd(v1, v1), _mm256_setzero_pd(), _CMP_UNORD_Q);
+        let nan2 = _mm256_cmp_pd(_mm256_sub_pd(v2, v2), _mm256_setzero_pd(), _CMP_UNORD_Q);
+        let nan3 = _mm256_cmp_pd(_mm256_sub_pd(v3, v3), _mm256_setzero_pd(), _CMP_UNORD_Q);
         let nan_any = _mm256_or_pd(_mm256_or_pd(nan0, nan1), _mm256_or_pd(nan2, nan3));
         if _mm256_movemask_pd(nan_any) != 0 {
-            // Find the exact NaN for the error message
+            // Find the exact NaN/Inf for the error message
             for &val in &src[i..std::cmp::min(i + 16, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -104,7 +105,7 @@ pub(super) unsafe fn f64_to_u8_clamp(
     // Scalar tail (at most 15 elements)
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
@@ -143,11 +144,11 @@ pub(super) unsafe fn f64_to_i32_clamp(
     for i in (0..simd_len).step_by(4) {
         let v = _mm256_loadu_pd(src.as_ptr().add(i));
 
-        // Inline NaN check
-        let nan_mask = _mm256_cmp_pd(v, v, _CMP_UNORD_Q);
+        // Inline NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
+        let nan_mask = _mm256_cmp_pd(_mm256_sub_pd(v, v), _mm256_setzero_pd(), _CMP_UNORD_Q);
         if _mm256_movemask_pd(nan_mask) != 0 {
             for &val in &src[i..std::cmp::min(i + 4, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -162,7 +163,7 @@ pub(super) unsafe fn f64_to_i32_clamp(
     // Scalar tail
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
@@ -209,12 +210,12 @@ pub(super) unsafe fn f32_to_u8_clamp(
         let v0 = _mm256_loadu_ps(ptr);
         let v1 = _mm256_loadu_ps(ptr.add(8));
 
-        // Inline NaN check
-        let nan0 = _mm256_cmp_ps(v0, v0, _CMP_UNORD_Q);
-        let nan1 = _mm256_cmp_ps(v1, v1, _CMP_UNORD_Q);
+        // Inline NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
+        let nan0 = _mm256_cmp_ps(_mm256_sub_ps(v0, v0), _mm256_setzero_ps(), _CMP_UNORD_Q);
+        let nan1 = _mm256_cmp_ps(_mm256_sub_ps(v1, v1), _mm256_setzero_ps(), _CMP_UNORD_Q);
         if (_mm256_movemask_ps(nan0) | _mm256_movemask_ps(nan1)) != 0 {
             for &val in &src[i..std::cmp::min(i + 16, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val as f64 });
                 }
             }
@@ -247,7 +248,7 @@ pub(super) unsafe fn f32_to_u8_clamp(
     // Scalar tail
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val as f64 });
         }
         let rounded = match rounding {
@@ -351,11 +352,11 @@ pub(super) unsafe fn f64_to_i32_check(
     for i in (0..simd_len).step_by(4) {
         let v = _mm256_loadu_pd(src.as_ptr().add(i));
 
-        // NaN check
-        let nan_mask = _mm256_cmp_pd(v, v, _CMP_UNORD_Q);
+        // NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
+        let nan_mask = _mm256_cmp_pd(_mm256_sub_pd(v, v), _mm256_setzero_pd(), _CMP_UNORD_Q);
         if _mm256_movemask_pd(nan_mask) != 0 {
             for &val in &src[i..std::cmp::min(i + 4, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -393,7 +394,7 @@ pub(super) unsafe fn f64_to_i32_check(
     // Scalar tail
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
