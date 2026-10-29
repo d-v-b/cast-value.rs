@@ -175,7 +175,7 @@ fn wrap(value: i128, bits: u32, signed: bool) -> i128 {
 }
 
 /// The outcome of one conversion, comparable between the crate and an oracle.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Outcome {
     Int(i128),
     /// A non-NaN float result, as the bits of its (exact) `f64` widening, so
@@ -224,11 +224,28 @@ impl Outcome {
     }
 }
 
+/// Reference int→int cast: range-check, clamp or wrap the exact value.
+pub fn int_to_int(
+    value: i128,
+    (bits, signed): (u32, bool),
+    out_of_range: Option<OutOfRangeMode>,
+) -> Outcome {
+    let (lo, hi) = int_bounds(bits, signed);
+    if (lo..=hi).contains(&value) {
+        return Outcome::Int(value);
+    }
+    match out_of_range {
+        Some(OutOfRangeMode::Clamp) => Outcome::Int(value.clamp(lo, hi)),
+        Some(OutOfRangeMode::Wrap) => Outcome::Int(wrap(value, bits, signed)),
+        None => Outcome::OutOfRange { lo, hi },
+    }
+}
+
 /// Reference float→int cast: round the exact value, then range-check, clamp
-/// or wrap it.
+/// or wrap it as an integer.
 pub fn float_to_int(
     x: f64,
-    (bits, signed): (u32, bool),
+    target: (u32, bool),
     rounding: RoundingMode,
     out_of_range: Option<OutOfRangeMode>,
 ) -> Outcome {
@@ -238,35 +255,23 @@ pub fn float_to_int(
     let exact = Exact::from_f64(x);
     // A non-negative exponent means `x` is already an integer. Beyond 2^64 it
     // only matters that `x` is out of every range and a multiple of 2^65 (so
-    // 0 modulo 2^N), which `None` stands for.
-    let magnitude = if exact.exponent >= 0 {
-        (exact.exponent <= 64).then(|| exact.magnitude << exact.exponent)
-    } else {
-        Some(shift_round(
+    // 0 modulo 2^N), which 2^65 itself also is.
+    let magnitude = match exact.exponent {
+        65.. => 1 << 65,
+        0..=64 => exact.magnitude << exact.exponent,
+        ..0 => shift_round(
             exact.magnitude,
             exact.exponent.unsigned_abs(),
             exact.negative,
             rounding,
-        ))
+        ),
     };
-    let value = magnitude.map(|magnitude| {
-        if exact.negative {
-            -(magnitude as i128)
-        } else {
-            magnitude as i128
-        }
-    });
-    let (lo, hi) = int_bounds(bits, signed);
-    match value {
-        Some(value) if (lo..=hi).contains(&value) => Outcome::Int(value),
-        _ => match out_of_range {
-            Some(OutOfRangeMode::Clamp) => Outcome::Int(if exact.negative { lo } else { hi }),
-            Some(OutOfRangeMode::Wrap) => {
-                Outcome::Int(value.map_or(0, |value| wrap(value, bits, signed)))
-            }
-            None => Outcome::OutOfRange { lo, hi },
-        },
-    }
+    let value = if exact.negative {
+        -(magnitude as i128)
+    } else {
+        magnitude as i128
+    };
+    int_to_int(value, target, out_of_range)
 }
 
 /// Reference cast of an exact value to a float format: round with an

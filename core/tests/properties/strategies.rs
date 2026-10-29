@@ -167,3 +167,80 @@ pub fn u32_values() -> impl Strategy<Value = u32> {
 pub fn u64_values() -> impl Strategy<Value = u64> {
     unsigned_values!(u64)
 }
+
+/// An input, up to four scalar-map keys and raw targets for them. Keys come
+/// from `related(input)` (values that collide with the input, or nearly) or
+/// from `inputs`, so repeated and overlapping keys are common.
+pub fn mapped_inputs<S, I>(
+    inputs: fn() -> I,
+    related: fn(S) -> Vec<S>,
+) -> impl Strategy<Value = (S, Vec<S>, Vec<u64>)>
+where
+    S: Copy + std::fmt::Debug + 'static,
+    I: Strategy<Value = S> + 'static,
+{
+    inputs().prop_flat_map(move |input| {
+        let key = prop_oneof![prop::sample::select(related(input)), inputs()];
+        (
+            Just(input),
+            prop::collection::vec(key, 0..=4),
+            prop::collection::vec(any::<u64>(), 4),
+        )
+    })
+}
+
+/// Keys that collide with a float input: itself, its negation (`-0.0` for
+/// `0.0`), both zeros, and NaNs of either sign and other payloads.
+macro_rules! related_floats {
+    ($name:ident, $ty:ty, $signaling_nan_bits:expr) => {
+        pub fn $name(input: $ty) -> Vec<$ty> {
+            vec![
+                input,
+                -input,
+                0.0,
+                -0.0,
+                <$ty>::NAN,
+                -<$ty>::NAN,
+                <$ty>::from_bits($signaling_nan_bits),
+            ]
+        }
+    };
+}
+
+related_floats!(related_f64, f64, 0x7ff0_0000_0000_0001);
+related_floats!(related_f32, f32, 0x7f80_0001);
+
+/// Keys that collide with an integer input, or miss it by one.
+macro_rules! related_ints {
+    ($name:ident, $ty:ty) => {
+        pub fn $name(input: $ty) -> Vec<$ty> {
+            vec![input, input.wrapping_add(1), input.wrapping_sub(1), 0]
+        }
+    };
+}
+
+related_ints!(related_i32, i32);
+related_ints!(related_i64, i64);
+related_ints!(related_u32, u32);
+related_ints!(related_u64, u64);
+
+/// A slice plus scalar-map key picks (resolved against the slice by
+/// `keys_from`) and raw targets.
+pub fn mapped_slices<T: Copy + std::fmt::Debug + 'static>(
+    values: impl Strategy<Value = T> + 'static,
+    in_range: impl Strategy<Value = T> + 'static,
+) -> impl Strategy<Value = (Vec<T>, Vec<prop::sample::Index>, Vec<u64>)> {
+    (
+        slices(values, in_range),
+        prop::collection::vec(any::<prop::sample::Index>(), 0..=3),
+        prop::collection::vec(any::<u64>(), 3),
+    )
+}
+
+/// The slice elements `picks` select (none for an empty slice).
+pub fn keys_from<T: Copy>(src: &[T], picks: &[prop::sample::Index]) -> Vec<T> {
+    if src.is_empty() {
+        return Vec::new();
+    }
+    picks.iter().map(|pick| *pick.get(src)).collect()
+}
