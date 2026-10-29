@@ -40,19 +40,22 @@ unsafe fn round_f32x4(v: v128, mode: RoundingMode) -> v128 {
     }
 }
 
-/// Return `true` if any lane in a f64x2 vector is NaN.
+/// Return `true` if any lane in a f64x2 vector is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f64x2(v: v128) -> bool {
+unsafe fn any_non_finite_f64x2(v: v128) -> bool {
+    // `v - v` is NaN exactly in the lanes where `v` is NaN or ±Inf.
     // f64x2_eq returns all-ones for non-NaN, all-zeros for NaN
-    let eq = f64x2_eq(v, v);
-    // Extract lanes and check if any is zero (NaN)
+    let d = f64x2_sub(v, v);
+    let eq = f64x2_eq(d, d);
+    // Extract lanes and check if any is zero (non-finite)
     u64x2_extract_lane::<0>(eq) == 0 || u64x2_extract_lane::<1>(eq) == 0
 }
 
-/// Return `true` if any lane in a f32x4 vector is NaN.
+/// Return `true` if any lane in a f32x4 vector is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f32x4(v: v128) -> bool {
-    let eq = f32x4_eq(v, v);
+unsafe fn any_non_finite_f32x4(v: v128) -> bool {
+    let d = f32x4_sub(v, v);
+    let eq = f32x4_eq(d, d);
     u32x4_extract_lane::<0>(eq) == 0
         || u32x4_extract_lane::<1>(eq) == 0
         || u32x4_extract_lane::<2>(eq) == 0
@@ -80,10 +83,10 @@ pub(super) unsafe fn f64_to_u8_clamp(
     while i + 2 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f64x2(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f64x2(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 2] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -110,11 +113,11 @@ pub(super) unsafe fn f64_to_u8_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
-            RoundingMode::NearestEven => val.round(),
+            RoundingMode::NearestEven => val.round_ties_even(),
             RoundingMode::TowardsZero => val.trunc(),
             RoundingMode::TowardsPositive => val.ceil(),
             RoundingMode::TowardsNegative => val.floor(),
@@ -147,10 +150,10 @@ pub(super) unsafe fn f64_to_i32_clamp(
     while i + 2 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f64x2(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f64x2(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 2] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -177,11 +180,11 @@ pub(super) unsafe fn f64_to_i32_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = match rounding {
-            RoundingMode::NearestEven => val.round(),
+            RoundingMode::NearestEven => val.round_ties_even(),
             RoundingMode::TowardsZero => val.trunc(),
             RoundingMode::TowardsPositive => val.ceil(),
             RoundingMode::TowardsNegative => val.floor(),
@@ -229,7 +232,7 @@ pub(super) unsafe fn f64_to_f32_nearest(
     if error_on_overflow {
         for i in 0..n {
             if src[i].is_finite() && dst[i].is_infinite() {
-                return Err(crate::CastError::OutOfRange {
+                return Err(crate::CastError::FloatOutOfRange {
                     value: src[i],
                     lo: f32::MIN as f64,
                     hi: f32::MAX as f64,
@@ -255,74 +258,34 @@ pub(super) unsafe fn f64_to_i32_check(
     dst: &mut [i32],
     rounding: RoundingMode,
 ) -> Result<(), crate::CastError> {
-    let mut i = 0;
-    let len = src.len();
+    let n = src.len();
+    let simd_len = n / 2 * 2;
 
-    let lo_val = i32::MIN as f64;
-    let hi_val = i32::MAX as f64;
+    let lo = i32::MIN as f64;
+    let hi = i32::MAX as f64;
 
-    while i + 2 <= len {
+    for i in (0..simd_len).step_by(2) {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
-
-        if any_nan_f64x2(v) {
-            for &val in &src[i..i + 2] {
-                if val.is_nan() {
-                    return Err(crate::CastError::NanOrInf { value: val });
-                }
-            }
-        }
-
         let rounded = round_f64x2(v, rounding);
 
-        // Range check via lane extraction (WASM lacks f64x2 compare-to-mask)
+        // Range check via lane extraction (WASM lacks f64x2 compare-to-mask).
+        // NaN fails both comparisons, so non-finite lanes are checked separately.
         let r0 = f64x2_extract_lane::<0>(rounded);
         let r1 = f64x2_extract_lane::<1>(rounded);
-        if r0 < lo_val || r0 > hi_val {
-            return Err(crate::CastError::OutOfRange {
-                value: f64x2_extract_lane::<0>(v),
-                lo: lo_val,
-                hi: hi_val,
-            });
-        }
-        if r1 < lo_val || r1 > hi_val {
-            return Err(crate::CastError::OutOfRange {
-                value: f64x2_extract_lane::<1>(v),
-                lo: lo_val,
-                hi: hi_val,
-            });
+        if any_non_finite_f64x2(v) || r0 < lo || r0 > hi || r1 < lo || r1 > hi {
+            // A NaN/Inf or out-of-range lane: finish on the scalar path, which
+            // reports the first error in element order, exactly as the
+            // non-SIMD path does.
+            return super::f64_to_i32_check_scalar(&src[i..], &mut dst[i..], rounding);
         }
 
         let i32_vals = i32x4_trunc_sat_f64x2_zero(rounded);
         dst[i] = i32x4_extract_lane::<0>(i32_vals);
         dst[i + 1] = i32x4_extract_lane::<1>(i32_vals);
-
-        i += 2;
     }
 
     // Scalar tail
-    for idx in i..len {
-        let val = src[idx];
-        if val.is_nan() {
-            return Err(crate::CastError::NanOrInf { value: val });
-        }
-        let rounded = match rounding {
-            RoundingMode::NearestEven => val.round_ties_even(),
-            RoundingMode::TowardsZero => val.trunc(),
-            RoundingMode::TowardsPositive => val.ceil(),
-            RoundingMode::TowardsNegative => val.floor(),
-            RoundingMode::NearestAway => unreachable!(),
-        };
-        if rounded < lo_val || rounded > hi_val {
-            return Err(crate::CastError::OutOfRange {
-                value: val,
-                lo: lo_val,
-                hi: hi_val,
-            });
-        }
-        dst[idx] = rounded as i32;
-    }
-
-    Ok(())
+    super::f64_to_i32_check_scalar(&src[simd_len..], &mut dst[simd_len..], rounding)
 }
 
 // ---------------------------------------------------------------------------
@@ -346,10 +309,10 @@ pub(super) unsafe fn f32_to_u8_clamp(
     while i + 4 <= len {
         let v = v128_load(src.as_ptr().add(i) as *const v128);
 
-        if any_nan_f32x4(v) {
-            // Find which value is NaN for error reporting
+        if any_non_finite_f32x4(v) {
+            // Find which value is NaN/Inf for error reporting
             for &val in &src[i..i + 4] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val as f64 });
                 }
             }
@@ -378,11 +341,11 @@ pub(super) unsafe fn f32_to_u8_clamp(
     // Scalar tail
     for idx in i..len {
         let val = src[idx];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val as f64 });
         }
         let rounded = match rounding {
-            RoundingMode::NearestEven => val.round(),
+            RoundingMode::NearestEven => val.round_ties_even(),
             RoundingMode::TowardsZero => val.trunc(),
             RoundingMode::TowardsPositive => val.ceil(),
             RoundingMode::TowardsNegative => val.floor(),

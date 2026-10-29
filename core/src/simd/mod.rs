@@ -32,7 +32,7 @@ mod generic;
 
 /// Try to convert f64 slice to u8 slice using SIMD with clamping.
 ///
-/// Always returns `Ok(true)` on success or `Err` if a NaN was detected.
+/// Always returns `Ok(true)` on success or `Err` if a NaN or ±Inf was detected.
 ///
 /// # Preconditions
 ///
@@ -48,7 +48,7 @@ pub fn try_f64_to_u8_clamp(
 
 /// Try to convert f64 slice to i32 slice using SIMD with clamping.
 ///
-/// Always returns `Ok(true)` on success or `Err` if a NaN was detected.
+/// Always returns `Ok(true)` on success or `Err` if a NaN or ±Inf was detected.
 ///
 /// # Preconditions
 ///
@@ -64,7 +64,7 @@ pub fn try_f64_to_i32_clamp(
 
 /// Try to convert f32 slice to u8 slice using SIMD with clamping.
 ///
-/// Always returns `Ok(true)` on success or `Err` if a NaN was detected.
+/// Always returns `Ok(true)` on success or `Err` if a NaN or ±Inf was detected.
 ///
 /// # Preconditions
 ///
@@ -107,6 +107,40 @@ pub fn try_f64_to_i32_check(
     rounding: RoundingMode,
 ) -> Result<bool, crate::CastError> {
     dispatch_f64_to_i32_check(src, dst, rounding)
+}
+
+/// Convert f64 to i32 element by element on the scalar path, with no
+/// out-of-range mode, stopping at the first error.
+///
+/// The `f64_to_i32_check` kernels hand over to this for their scalar tail and
+/// for the rest of the slice once a vector holds a NaN/Inf or out-of-range
+/// lane, so their errors match the scalar path in both variant and order.
+///
+/// # Errors
+///
+/// Returns the first element's `CastError`, as `convert_float_to_int` would.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn f64_to_i32_check_scalar(
+    src: &[f64],
+    dst: &mut [i32],
+    rounding: RoundingMode,
+) -> Result<(), crate::CastError> {
+    let config = crate::FloatToIntConfig {
+        map_entries: Vec::new(), // `Vec::new` does not allocate
+        rounding,
+        out_of_range: None,
+    };
+    for (&val, out) in src.iter().zip(dst.iter_mut()) {
+        *out = crate::convert_float_to_int(val, &config)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -459,21 +493,10 @@ mod tests {
         }
     }
 
-    /// Test boundary values: 0, 255, negative, >255, Inf.
+    /// Test boundary values: 0, 255, negative, >255.
     #[test]
     fn test_f64_to_u8_boundaries() {
-        let src = vec![
-            0.0,
-            255.0,
-            -0.0,
-            -100.0,
-            500.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            0.5,
-            254.5,
-            127.3,
-        ];
+        let src = vec![0.0, 255.0, -0.0, -100.0, 500.0, 0.5, 254.5, 127.3];
         let expected = scalar_f64_to_u8_clamp(&src, RoundingMode::NearestEven).unwrap();
         let mut dst = vec![0u8; src.len()];
         let result = try_f64_to_u8_clamp(&src, &mut dst, RoundingMode::NearestEven)
@@ -539,6 +562,40 @@ mod tests {
             matches!(result, Err(crate::CastError::NanOrInf { .. })),
             "expected NanOrInf error, got {result:?}"
         );
+    }
+
+    /// ±Inf is not representable in an integer type, so every float→int kernel
+    /// must reject it rather than clamp it. Lengths cover both the vector body
+    /// and the scalar tail of every architecture's kernel.
+    #[test]
+    fn test_float_to_int_kernels_reject_inf() {
+        for len in [1, 2, 3, 8, 9, 16, 17, 33] {
+            for inf in [f64::INFINITY, f64::NEG_INFINITY] {
+                for pos in [0, len / 2, len - 1] {
+                    let mut src = vec![1.0_f64; len];
+                    src[pos] = inf;
+                    let src_f32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+                    let mut dst_u8 = vec![0u8; len];
+                    let mut dst_i32 = vec![0i32; len];
+                    let results = [
+                        try_f64_to_u8_clamp(&src, &mut dst_u8, RoundingMode::NearestEven),
+                        try_f64_to_i32_clamp(&src, &mut dst_i32, RoundingMode::NearestEven),
+                        try_f64_to_i32_check(&src, &mut dst_i32, RoundingMode::NearestEven),
+                        try_f32_to_u8_clamp(&src_f32, &mut dst_u8, RoundingMode::NearestEven),
+                    ];
+                    // Only the check kernel may be unavailable on a CPU (`Ok(false)`,
+                    // meaning the caller falls back to the scalar path); the clamp
+                    // kernels always run.
+                    for (kernel, result) in results.into_iter().enumerate() {
+                        let fallback_ok = kernel == 2 && matches!(result, Ok(false));
+                        assert!(
+                            fallback_ok || matches!(result, Err(crate::CastError::NanOrInf { .. })),
+                            "kernel {kernel}, len={len}, pos={pos}, {inf}: got {result:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Empty slice should succeed with Ok(true).

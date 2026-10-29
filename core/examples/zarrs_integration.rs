@@ -342,6 +342,7 @@ impl CastValueCodec {
                 let config = IntToFloatConfig {
                     map_entries: parse_map_entries_from_json::<$src, $dst>(&self.encode_map),
                     rounding: self.rounding,
+                    out_of_range: self.out_of_range,
                 };
                 zarr_cast_value::convert_slice_int_to_float(
                     bytes_as_slice::<$src>(src_bytes),

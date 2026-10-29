@@ -40,10 +40,10 @@ are called:
 
 | Path | Pipeline |
 |---|---|
-| float to int | scalar_map, reject NaN, round, range check/clamp/wrap, cast |
+| float to int | scalar_map, reject NaN/Inf, round, range check/clamp/wrap, cast |
 | int to int | scalar_map, range check/clamp/wrap, cast |
 | float to float | scalar_map, NaN/Inf propagation, cast, rounding adjustment, overflow check |
-| int to float | scalar_map, cast, rounding adjustment |
+| int to float | scalar_map, round to target precision, overflow check |
 
 Each path exists at two levels:
 
@@ -67,18 +67,19 @@ the target type. There is no promotion to an intermediate like f64.
 - Range checking compares against target bounds expressed in `Src` space
 - The actual type conversion happens once, at the end
 
-The only uses of `to_f64_lossy()` are: error messages (not on the hot path),
-Python boundary (scalar map parsing, once at dispatch time), and rounding
-adjustment inexactness detection (does not affect the output value).
+`to_f64_lossy()` is exact for every float source (f16, f32 and f64 all
+convert to f64 without rounding). It is used for error messages, for detecting
+inexact float→float casts, for the float→float overflow threshold, and to
+compute float→int `wrap` exactly in the 64-bit domain. Integer sources only go
+through it for error messages; int→float rounding works on the integer's bits.
 
 ## Trait design
 
 ```rust
 trait CastNum: Copy + PartialEq + PartialOrd + Debug + ToPrimitive {}
-trait CastInt: CastNum {}
+trait CastInt: CastNum + FromPrimitive {}
 trait CastFloat: CastNum + Float + One + Add + Sub {
     fn round_with_mode(self, mode: RoundingMode) -> Self;
-    fn rem_euclid(self, rhs: Self) -> Self;
     fn next_up(self) -> Self;
     fn next_down(self) -> Self;
 }

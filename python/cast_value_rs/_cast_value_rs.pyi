@@ -47,8 +47,9 @@ def cast_array(
     rounding_mode
         How to round values during conversion.
     out_of_range_mode
-        How to handle values outside the target type's range.
-        ``None`` means out-of-range values raise an error.
+        How to handle values outside the target type's range (after
+        rounding). ``None`` means out-of-range values raise an error.
+        ``"clamp"`` maps float-target overflow to ±Inf.
     scalar_map_entries
         Mapping of special source values to target values, applied before
         any other conversion logic. Accepts a dict or any iterable of
@@ -63,8 +64,9 @@ def cast_array(
     Raises
     ------
     ValueError
-        If a value cannot be converted (e.g. NaN to int without a
-        scalar_map entry, or out-of-range without a mode set).
+        If a value cannot be converted (e.g. NaN or ±Inf to int without a
+        scalar_map entry, even with ``"clamp"``; or out-of-range without a
+        mode set).
     TypeError
         If the source or target dtype is unsupported.
     """
@@ -90,8 +92,9 @@ def cast_array_into(
     rounding_mode
         How to round values during conversion.
     out_of_range_mode
-        How to handle values outside the target type's range.
-        ``None`` means out-of-range values raise an error.
+        How to handle values outside the target type's range (after
+        rounding). ``None`` means out-of-range values raise an error.
+        ``"clamp"`` maps float-target overflow to ±Inf.
     scalar_map_entries
         Mapping of special source values to target values. Accepts a dict
         or any iterable of ``(source, target)`` pairs.

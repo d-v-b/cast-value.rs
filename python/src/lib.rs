@@ -255,15 +255,23 @@ fn readonly_row_major<'py, T: numpy::Element>(
 /// Panic message for `as_slice` on an array `readonly_row_major` accepted.
 const C_CONTIGUOUS_SLICE: &str = "a C-contiguous array's buffer is a valid slice";
 
+/// Conversion settings shared by every `do_*` helper.
+///
+/// `'a` borrows the caller's arguments; `'py` ties `map_entries_py` to the GIL
+/// token. Int→int helpers ignore `rounding`.
+struct CastOptions<'a, 'py> {
+    rounding: RoundingMode,
+    oor: Option<OutOfRangeMode>,
+    map_entries_py: Option<&'a Bound<'py, PyAny>>,
+    src_dtype: &'a str,
+    tgt_dtype: &'a str,
+}
+
 /// Perform a float→int conversion on numpy arrays.
 fn do_float_to_int_alloc<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
@@ -272,9 +280,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = FloatToIntConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let shape: Vec<usize> = arr.shape().to_vec();
     let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
@@ -299,10 +311,7 @@ where
 fn do_int_to_int_alloc<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
@@ -311,8 +320,12 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = IntToIntConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        out_of_range: opts.oor,
     };
     let shape: Vec<usize> = arr.shape().to_vec();
     let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
@@ -336,11 +349,7 @@ where
 fn do_float_to_float_alloc<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
@@ -349,9 +358,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = FloatToFloatConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let shape: Vec<usize> = arr.shape().to_vec();
     let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
@@ -375,10 +388,7 @@ where
 fn do_int_to_float_alloc<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
@@ -387,8 +397,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = IntToFloatConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let shape: Vec<usize> = arr.shape().to_vec();
     let output = PyArrayDyn::<Dst>::zeros(py, &shape[..], false);
@@ -416,11 +431,7 @@ fn do_float_to_int_into<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
     out: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
@@ -429,9 +440,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = FloatToIntConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.cast()?;
     // Zero-size arrays skip the conversion: there is nothing to convert, and
@@ -456,10 +471,7 @@ fn do_int_to_int_into<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
     out: &Bound<'py, PyUntypedArray>,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
@@ -468,8 +480,12 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = IntToIntConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        out_of_range: opts.oor,
     };
     let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.cast()?;
     // Zero-size arrays skip the conversion: there is nothing to convert, and
@@ -494,11 +510,7 @@ fn do_float_to_float_into<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
     out: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    oor: Option<OutOfRangeMode>,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastFloat + CastInto<Dst> + ExtractFromPy + numpy::Element + 'static,
@@ -507,9 +519,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = FloatToFloatConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
-        out_of_range: oor,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.cast()?;
     // Zero-size arrays skip the conversion: there is nothing to convert, and
@@ -534,10 +550,7 @@ fn do_int_to_float_into<'py, Src, Dst>(
     py: Python<'py>,
     arr: &Bound<'py, PyUntypedArray>,
     out: &Bound<'py, PyUntypedArray>,
-    rounding: RoundingMode,
-    map_entries_py: Option<&Bound<'py, PyAny>>,
-    src_dtype: &str,
-    tgt_dtype: &str,
+    opts: &CastOptions<'_, 'py>,
 ) -> PyResult<Py<PyAny>>
 where
     Src: CastInt + CastInto<Dst> + ExtractFromPy + numpy::Element,
@@ -546,8 +559,13 @@ where
     let input_arr: PyReadonlyArrayDyn<'_, Src> = readonly_row_major(arr)?;
     let src_slice = input_arr.as_slice().expect(C_CONTIGUOUS_SLICE);
     let config = IntToFloatConfig {
-        map_entries: parse_map_entries::<Src, Dst>(map_entries_py, src_dtype, tgt_dtype)?,
-        rounding,
+        map_entries: parse_map_entries::<Src, Dst>(
+            opts.map_entries_py,
+            opts.src_dtype,
+            opts.tgt_dtype,
+        )?,
+        rounding: opts.rounding,
+        out_of_range: opts.oor,
     };
     let out_arr: &Bound<'_, PyArrayDyn<Dst>> = out.cast()?;
     // Zero-size arrays skip the conversion: there is nothing to convert, and
@@ -583,56 +601,33 @@ fn dispatch_alloc<'py>(
     oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    let opts = CastOptions {
+        rounding,
+        oor,
+        map_entries_py,
+        src_dtype,
+        tgt_dtype,
+    };
     // Dispatch uses four path-specific macros to call the right conversion
     // function.
     macro_rules! float_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_float_to_int_alloc::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                rounding,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_float_to_int_alloc::<$src_ty, $dst_ty>(py, arr, &opts)
         };
     }
     macro_rules! int_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_int_to_int_alloc::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_int_to_int_alloc::<$src_ty, $dst_ty>(py, arr, &opts)
         };
     }
     macro_rules! float_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_float_to_float_alloc::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                rounding,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_float_to_float_alloc::<$src_ty, $dst_ty>(py, arr, &opts)
         };
     }
     macro_rules! int_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_int_to_float_alloc::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                rounding,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_int_to_float_alloc::<$src_ty, $dst_ty>(py, arr, &opts)
         };
     }
 
@@ -712,58 +707,31 @@ fn dispatch_into<'py>(
     oor: Option<OutOfRangeMode>,
     map_entries_py: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    let opts = CastOptions {
+        rounding,
+        oor,
+        map_entries_py,
+        src_dtype,
+        tgt_dtype,
+    };
     macro_rules! float_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_float_to_int_into::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                out,
-                rounding,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_float_to_int_into::<$src_ty, $dst_ty>(py, arr, out, &opts)
         };
     }
     macro_rules! int_to_int {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_int_to_int_into::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                out,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_int_to_int_into::<$src_ty, $dst_ty>(py, arr, out, &opts)
         };
     }
     macro_rules! float_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_float_to_float_into::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                out,
-                rounding,
-                oor,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_float_to_float_into::<$src_ty, $dst_ty>(py, arr, out, &opts)
         };
     }
     macro_rules! int_to_float {
         ($src_ty:ty, $dst_ty:ty) => {
-            do_int_to_float_into::<$src_ty, $dst_ty>(
-                py,
-                arr,
-                out,
-                rounding,
-                map_entries_py,
-                src_dtype,
-                tgt_dtype,
-            )
+            do_int_to_float_into::<$src_ty, $dst_ty>(py, arr, out, &opts)
         };
     }
 

@@ -42,20 +42,23 @@ unsafe fn round_f32x4(v: float32x4_t, mode: RoundingMode) -> float32x4_t {
     }
 }
 
-/// Return `true` if any lane in a `float64x2_t` is NaN.
+/// Return `true` if any lane in a `float64x2_t` is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f64x2(v: float64x2_t) -> bool {
-    // vceqq_f64(v, v) yields all-ones for non-NaN, all-zeros for NaN.
-    // If the minimum byte across all lanes is 0, at least one lane was NaN.
-    let eq = vceqq_f64(v, v);
+unsafe fn any_non_finite_f64x2(v: float64x2_t) -> bool {
+    // `v - v` is NaN exactly in the lanes where `v` is NaN or ±Inf.
+    // vceqq_f64(d, d) yields all-ones for non-NaN, all-zeros for NaN.
+    // If the minimum byte across all lanes is 0, at least one lane was non-finite.
+    let d = vsubq_f64(v, v);
+    let eq = vceqq_f64(d, d);
     let eq_bytes: uint8x16_t = vreinterpretq_u8_u64(eq);
     vminvq_u8(eq_bytes) == 0
 }
 
-/// Return `true` if any lane in a `float32x4_t` is NaN.
+/// Return `true` if any lane in a `float32x4_t` is NaN or ±Inf.
 #[inline(always)]
-unsafe fn any_nan_f32x4(v: float32x4_t) -> bool {
-    let eq = vceqq_f32(v, v);
+unsafe fn any_non_finite_f32x4(v: float32x4_t) -> bool {
+    let d = vsubq_f32(v, v);
+    let eq = vceqq_f32(d, d);
     let not_eq: uint8x16_t = vreinterpretq_u8_u32(vmvnq_u32(eq));
     vmaxvq_u8(not_eq) != 0
 }
@@ -67,7 +70,7 @@ unsafe fn any_nan_f32x4(v: float32x4_t) -> bool {
 ///
 /// Pipeline per 8 elements:
 /// 1. Load 4 × `float64x2`
-/// 2. NaN check (batch)
+/// 2. NaN/Inf check (batch)
 /// 3. Round each
 /// 4. Clamp to [0.0, 255.0]
 /// 5. Convert `f64x2` → `i32x2` (`vcvtq_s64_f64` + `vmovn_s64`)
@@ -98,10 +101,14 @@ pub(super) unsafe fn f64_to_u8_clamp(
         let v2 = vld1q_f64(ptr.add(4));
         let v3 = vld1q_f64(ptr.add(6));
 
-        // Batch NaN check
-        if any_nan_f64x2(v0) || any_nan_f64x2(v1) || any_nan_f64x2(v2) || any_nan_f64x2(v3) {
+        // Batch NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
+        if any_non_finite_f64x2(v0)
+            || any_non_finite_f64x2(v1)
+            || any_non_finite_f64x2(v2)
+            || any_non_finite_f64x2(v3)
+        {
             for &val in &src[i..std::cmp::min(i + 8, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -168,9 +175,9 @@ pub(super) unsafe fn f64_to_i32_clamp(
     for i in (0..simd_len).step_by(2) {
         let v = vld1q_f64(src.as_ptr().add(i));
 
-        if any_nan_f64x2(v) {
+        if any_non_finite_f64x2(v) {
             for &val in &src[i..std::cmp::min(i + 2, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val });
                 }
             }
@@ -189,7 +196,7 @@ pub(super) unsafe fn f64_to_i32_clamp(
     // Scalar tail (at most 1 element)
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = scalar_round_f64(val, rounding);
@@ -206,7 +213,7 @@ pub(super) unsafe fn f64_to_i32_clamp(
 ///
 /// Pipeline per 8 elements:
 /// 1. Load 2 × `float32x4`
-/// 2. NaN check
+/// 2. NaN/Inf check
 /// 3. Round, clamp to [0, 255]
 /// 4. Convert `f32x4` → `i32x4`
 /// 5. Narrow `i32x4` → `i16x4`, combine → `i16x8`
@@ -232,10 +239,10 @@ pub(super) unsafe fn f32_to_u8_clamp(
         let v0 = vld1q_f32(ptr);
         let v1 = vld1q_f32(ptr.add(4));
 
-        // NaN check
-        if any_nan_f32x4(v0) || any_nan_f32x4(v1) {
+        // NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
+        if any_non_finite_f32x4(v0) || any_non_finite_f32x4(v1) {
             for &val in &src[i..std::cmp::min(i + 8, n)] {
-                if val.is_nan() {
+                if !val.is_finite() {
                     return Err(crate::CastError::NanOrInf { value: val as f64 });
                 }
             }
@@ -268,7 +275,7 @@ pub(super) unsafe fn f32_to_u8_clamp(
     // Scalar tail (at most 7 elements)
     for i in simd_len..n {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val as f64 });
         }
         let rounded = match rounding {
@@ -331,7 +338,7 @@ pub(super) unsafe fn f64_to_f32_nearest(
                 // At least one result is Inf — check if source was finite
                 for (&sv, &dv) in src[i..].iter().zip(dst[i..].iter()).take(2) {
                     if sv.is_finite() && dv.is_infinite() {
-                        return Err(crate::CastError::OutOfRange {
+                        return Err(crate::CastError::FloatOutOfRange {
                             value: sv,
                             lo: f32::MIN as f64,
                             hi: f32::MAX as f64,
@@ -343,7 +350,7 @@ pub(super) unsafe fn f64_to_f32_nearest(
         // Tail check
         for i in simd_len..n {
             if src[i].is_finite() && dst[i].is_infinite() {
-                return Err(crate::CastError::OutOfRange {
+                return Err(crate::CastError::FloatOutOfRange {
                     value: src[i],
                     lo: f32::MIN as f64,
                     hi: f32::MAX as f64,
@@ -378,36 +385,17 @@ pub(super) unsafe fn f64_to_i32_check(
 
     for i in (0..simd_len).step_by(2) {
         let v = vld1q_f64(src.as_ptr().add(i));
-
-        // NaN check
-        if any_nan_f64x2(v) {
-            for &val in &src[i..std::cmp::min(i + 2, n)] {
-                if val.is_nan() {
-                    return Err(crate::CastError::NanOrInf { value: val });
-                }
-            }
-        }
-
         let r = round_f64x2(v, rounding);
 
-        // Range check: error if any value < lo or > hi
-        // vcltq_f64 returns all-ones for true, all-zeros for false
-        let below = vcltq_f64(r, lo);
-        let above = vcgtq_f64(r, hi);
-        let out_of_range = vorrq_u64(below, above);
+        // Range check: vcltq/vcgtq return all-ones lanes for true. NaN fails
+        // both comparisons, so non-finite lanes are checked separately.
+        let out_of_range = vorrq_u64(vcltq_f64(r, lo), vcgtq_f64(r, hi));
         let oor_bytes: uint8x16_t = vreinterpretq_u8_u64(out_of_range);
-        if vmaxvq_u8(oor_bytes) != 0 {
-            // Find exact offending element
-            for &val in src[i..].iter().take(2) {
-                let rounded = scalar_round_f64(val, rounding);
-                if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
-                    return Err(crate::CastError::OutOfRange {
-                        value: val,
-                        lo: i32::MIN as f64,
-                        hi: i32::MAX as f64,
-                    });
-                }
-            }
+        if any_non_finite_f64x2(v) || vmaxvq_u8(oor_bytes) != 0 {
+            // A NaN/Inf or out-of-range lane: finish on the scalar path, which
+            // reports the first error in element order, exactly as the
+            // non-SIMD path does.
+            return super::f64_to_i32_check_scalar(&src[i..], &mut dst[i..], rounding);
         }
 
         // Convert (values are in range, truncation after rounding is correct)
@@ -416,23 +404,7 @@ pub(super) unsafe fn f64_to_i32_check(
     }
 
     // Scalar tail
-    for i in simd_len..n {
-        let val = src[i];
-        if val.is_nan() {
-            return Err(crate::CastError::NanOrInf { value: val });
-        }
-        let rounded = scalar_round_f64(val, rounding);
-        if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
-            return Err(crate::CastError::OutOfRange {
-                value: val,
-                lo: i32::MIN as f64,
-                hi: i32::MAX as f64,
-            });
-        }
-        dst[i] = rounded as i32;
-    }
-
-    Ok(())
+    super::f64_to_i32_check_scalar(&src[simd_len..], &mut dst[simd_len..], rounding)
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +431,7 @@ unsafe fn scalar_tail_f64_to_u8(
 ) -> Result<(), crate::CastError> {
     for i in start..src.len() {
         let val = src[i];
-        if val.is_nan() {
+        if !val.is_finite() {
             return Err(crate::CastError::NanOrInf { value: val });
         }
         let rounded = scalar_round_f64(val, rounding);
