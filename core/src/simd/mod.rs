@@ -109,6 +109,40 @@ pub fn try_f64_to_i32_check(
     dispatch_f64_to_i32_check(src, dst, rounding)
 }
 
+/// Convert f64 to i32 element by element on the scalar path, with no
+/// out-of-range mode, stopping at the first error.
+///
+/// The `f64_to_i32_check` kernels hand over to this for their scalar tail and
+/// for the rest of the slice once a vector holds a NaN/Inf or out-of-range
+/// lane, so their errors match the scalar path in both variant and order.
+///
+/// # Errors
+///
+/// Returns the first element's `CastError`, as `convert_float_to_int` would.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn f64_to_i32_check_scalar(
+    src: &[f64],
+    dst: &mut [i32],
+    rounding: RoundingMode,
+) -> Result<(), crate::CastError> {
+    let config = crate::FloatToIntConfig {
+        map_entries: Vec::new(), // `Vec::new` does not allocate
+        rounding,
+        out_of_range: None,
+    };
+    for (&val, out) in src.iter().zip(dst.iter_mut()) {
+        *out = crate::convert_float_to_int(val, &config)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Architecture dispatch — each function selects the optimal kernel.
 // ---------------------------------------------------------------------------
@@ -549,11 +583,13 @@ mod tests {
                         try_f64_to_i32_check(&src, &mut dst_i32, RoundingMode::NearestEven),
                         try_f32_to_u8_clamp(&src_f32, &mut dst_u8, RoundingMode::NearestEven),
                     ];
-                    // `Ok(false)` means the kernel is unavailable on this CPU and
-                    // the caller falls back to the scalar path.
+                    // Only the check kernel may be unavailable on a CPU (`Ok(false)`,
+                    // meaning the caller falls back to the scalar path); the clamp
+                    // kernels always run.
                     for (kernel, result) in results.into_iter().enumerate() {
+                        let fallback_ok = kernel == 2 && matches!(result, Ok(false));
                         assert!(
-                            matches!(result, Err(crate::CastError::NanOrInf { .. }) | Ok(false)),
+                            fallback_ok || matches!(result, Err(crate::CastError::NanOrInf { .. })),
                             "kernel {kernel}, len={len}, pos={pos}, {inf}: got {result:?}"
                         );
                     }

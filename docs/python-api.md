@@ -23,8 +23,12 @@
 | Mode | Behavior |
 |---|---|
 | `None` | Error on the first out-of-range value |
-| `"clamp"` | Clamp to the target type's range |
-| `"wrap"` | Modular arithmetic (wrapping) |
+| `"clamp"` | Integer targets: clamp to the type's range. Float targets: map values beyond the finite range to ±Infinity |
+| `"wrap"` | Integer targets only: modular arithmetic (wrapping) |
+
+NaN and ±Infinity cannot be cast to an integer type in any mode: they raise
+unless a scalar map entry covers them. Out-of-range is judged after rounding,
+so a value that rounds onto the target's maximum is in range.
 
 ## Scalar map
 

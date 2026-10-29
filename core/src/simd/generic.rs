@@ -259,3 +259,40 @@ pub(super) fn f32_to_u8_clamp(
         .dispatch(F32ToU8ClampKernel { src, dst, rounding })
         .map(|()| true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The portable kernels run only on targets without a dedicated kernel
+    /// (e.g. x86_64 without AVX, armv7, wasm32 without simd128), so test them
+    /// directly: NaN and ±Inf must be rejected in every lane position, and
+    /// finite values must clamp.
+    #[test]
+    fn test_generic_kernels_reject_non_finite() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for len in [1, 2, 3, 4, 5, 8, 9, 16, 17] {
+                for pos in 0..len {
+                    let mut src = vec![1.0_f64; len];
+                    src[pos] = bad;
+                    let src_f32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+                    let results = [
+                        f64_to_u8_clamp(&src, &mut vec![0; len], RoundingMode::NearestEven),
+                        f64_to_i32_clamp(&src, &mut vec![0; len], RoundingMode::NearestEven),
+                        f32_to_u8_clamp(&src_f32, &mut vec![0; len], RoundingMode::NearestEven),
+                    ];
+                    for (kernel, result) in results.into_iter().enumerate() {
+                        assert!(
+                            matches!(result, Err(crate::CastError::NanOrInf { .. })),
+                            "kernel {kernel}, len={len}, pos={pos}, {bad}: got {result:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let src = [f64::MAX, -f64::MAX, 300.0, -5.0, 2.5, 3.5];
+        let mut dst = [0_u8; 6];
+        assert!(f64_to_u8_clamp(&src, &mut dst, RoundingMode::NearestEven).unwrap());
+        assert_eq!(dst, [255, 0, 255, 0, 2, 4]);
+    }
+}

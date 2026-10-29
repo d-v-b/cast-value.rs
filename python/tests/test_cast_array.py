@@ -5,7 +5,7 @@ from math import inf, nan
 import numpy as np
 import pytest
 
-from cast_value_rs import cast_array
+from cast_value_rs import cast_array, cast_array_into
 
 from .conftest import LAYOUT_DTYPE_PATHS, Expect, ExpectFail, layout_arrays, nan_eq
 
@@ -353,14 +353,36 @@ INT_TO_FLOAT_CASES = [
 ]
 
 
-def test_int_to_float16_overflow_error():
-    """Integers beyond float16's finite range fail without out_of_range."""
+@pytest.mark.parametrize(
+    ("value", "dtype", "rounding_mode"),
+    [
+        (70000, "int32", "nearest-even"),
+        # 65519 rounds to float16's max (65504) with nearest-even, but up
+        # past it towards +Inf, so it is out of range only in this mode.
+        (65519, "uint16", "towards-positive"),
+    ],
+)
+def test_int_to_float16_overflow_error(value, dtype, rounding_mode):
+    """Integers rounding beyond float16's finite range fail without
+    out_of_range, in both the allocating and the `into` variant."""
+    arr = np.array([value], dtype=dtype)
     with pytest.raises(ValueError, match="out of range"):
-        cast_array(
-            np.array([70000], dtype=np.int32),
-            target_dtype="float16",
-            rounding_mode="nearest-even",
+        cast_array(arr, target_dtype="float16", rounding_mode=rounding_mode)
+    with pytest.raises(ValueError, match="out of range"):
+        cast_array_into(
+            arr, np.empty(1, dtype=np.float16), rounding_mode=rounding_mode
         )
+
+
+def test_int_to_float16_directed_rounding_near_max():
+    """65535 overflows float16 with nearest-even, but towards-zero rounds it
+    onto the maximum, which is in range."""
+    arr = np.array([65535], dtype=np.uint16)
+    result = cast_array(arr, target_dtype="float16", rounding_mode="towards-zero")
+    np.testing.assert_array_equal(result, np.array([65504], dtype=np.float16))
+    out = np.empty(1, dtype=np.float16)
+    cast_array_into(arr, out, rounding_mode="towards-zero")
+    np.testing.assert_array_equal(out, np.array([65504], dtype=np.float16))
 
 
 @pytest.mark.parametrize(

@@ -19,12 +19,24 @@ pub enum CastError {
     /// A NaN or Infinity value was encountered when casting to an integer type.
     #[error("Cannot cast {value} to integer type without scalar_map")]
     NanOrInf { value: f64 },
-    /// A value is out of range for the target type and no out_of_range mode was set.
+    /// A value is outside an integer target's range and no out_of_range mode
+    /// was set. `lo` and `hi` are the target type's exact inclusive bounds.
     #[error(
         "Value {value} out of range [{lo}, {hi}]. \
          Set out_of_range='clamp' or out_of_range='wrap' to handle this."
     )]
-    OutOfRange { value: f64, lo: f64, hi: f64 },
+    OutOfRange { value: f64, lo: i128, hi: i128 },
+    /// A finite value rounds to a magnitude beyond a float target's finite
+    /// range `[lo, hi]`, and out_of_range is not `clamp` (`wrap` is not
+    /// permitted for float targets).
+    #[error(
+        "Value {value} out of range [{lo}, {hi}]. \
+         Set out_of_range='clamp' to map it to ±Infinity."
+    )]
+    FloatOutOfRange { value: f64, lo: f64, hi: f64 },
+    /// The source and destination slices have different lengths.
+    #[error("Source has {src_len} elements but destination has {dst_len}")]
+    LengthMismatch { src_len: usize, dst_len: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -111,15 +123,13 @@ pub trait CastInt: CastNum + FromPrimitive {}
 
 /// A floating-point numeric type (f32, f64).
 /// Carries float-specific operations not covered by `num_traits::Float`:
-/// mode-aware rounding, Euclidean remainder, and IEEE 754 nextUp/nextDown.
+/// mode-aware rounding and IEEE 754 nextUp/nextDown.
 ///
 /// `num_traits::Float` provides: `is_nan`, `is_infinite`, `is_finite`, `abs`.
 /// `num_traits::One` provides: `one()`.
 pub trait CastFloat: CastNum + Float + One + Add<Output = Self> + Sub<Output = Self> {
     /// Round to integer according to the given rounding mode.
     fn round_with_mode(self, mode: RoundingMode) -> Self;
-    /// Euclidean remainder (used in float→int wrap mode).
-    fn rem_euclid(self, rhs: Self) -> Self;
     /// The smallest representable value greater than self (IEEE 754 nextUp).
     fn next_up(self) -> Self;
     /// The largest representable value less than self (IEEE 754 nextDown).
@@ -244,7 +254,7 @@ const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 ///
 /// # Errors
 ///
-/// Returns `CastError::OutOfRange` unless `out_of_range` is `clamp`.
+/// Returns `CastError::FloatOutOfRange` unless `out_of_range` is `clamp`.
 fn float_overflow<Dst: CastFloat>(
     negative: bool,
     value: f64,
@@ -256,7 +266,7 @@ fn float_overflow<Dst: CastFloat>(
         } else {
             Dst::infinity()
         }),
-        Some(OutOfRangeMode::Wrap) | None => Err(CastError::OutOfRange {
+        Some(OutOfRangeMode::Wrap) | None => Err(CastError::FloatOutOfRange {
             value,
             lo: to_f64_lossy(Dst::min_value()),
             hi: to_f64_lossy(Dst::max_value()),
@@ -329,13 +339,33 @@ fn round_int_to_precision<Src: CastInt>(
     }
 }
 
+/// The bit width `N` and signedness of an integer type.
+///
+/// Both constant-fold after monomorphization.
+#[inline]
+fn int_width<T: CastInt>() -> (u32, bool) {
+    // Only signed types can represent -1.
+    (
+        8 * std::mem::size_of::<T>() as u32,
+        T::from_i64(-1).is_some(),
+    )
+}
+
+/// The exact inclusive bounds of an integer type, for error reporting.
+fn int_bounds<T: CastInt>() -> (i128, i128) {
+    match int_width::<T>() {
+        (bits, true) => (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1),
+        (bits, false) => (0, (1_i128 << bits) - 1),
+    }
+}
+
 /// Reduce a finite, integer-valued `f64` modulo `2^N` into the `N`-bit integer
 /// type `Dst`, using two's complement for signed targets.
 ///
 /// Exact for every input: values in `[-2^63, 2^63)` convert exactly to `i64`,
 /// whose two's complement bits are the residue modulo 2^64. Larger magnitudes
 /// are multiples of 2^11 in `f64`, so `rem_euclid(2^64)` cannot round.
-fn wrap_integral_f64<Dst: CastInt>(val: f64, signed: bool) -> Dst {
+fn wrap_integral_f64<Dst: CastInt>(val: f64) -> Dst {
     // `as` between integer types reinterprets the bits (two's complement).
     let residue = if (-TWO_POW_63..TWO_POW_63).contains(&val) {
         val as i64 as u64
@@ -344,7 +374,8 @@ fn wrap_integral_f64<Dst: CastInt>(val: f64, signed: bool) -> Dst {
     };
     // Shifting the residue's low N bits to the top and back keeps exactly
     // those bits; the arithmetic shift of an `i64` also sign-extends them.
-    let shift = u64::BITS - 8 * std::mem::size_of::<Dst>() as u32;
+    let (bits, signed) = int_width::<Dst>();
+    let shift = u64::BITS - bits;
     let wrapped = if signed {
         Dst::from_i64(((residue << shift) as i64) >> shift)
     } else {
@@ -392,7 +423,7 @@ where
     }
 
     // Step 3: round
-    let val = val.round_with_mode(config.rounding);
+    let rounded = val.round_with_mode(config.rounding);
 
     // Step 4: range check. `lo` (0 or -2^(N-1)) is exact in every float type,
     // but `hi` (2^k - 1) may round up to 2^k (e.g. `i32::MAX as f32` is 2^31),
@@ -402,20 +433,23 @@ where
     let lo = Src::dst_min();
     let hi = Src::dst_max();
     let hi_exclusive = hi + Src::one();
-    if val >= lo && val < hi_exclusive {
-        return Ok(val.cast_into());
+    if rounded >= lo && rounded < hi_exclusive {
+        return Ok(rounded.cast_into());
     }
 
     // Step 5: out-of-range handling
     match config.out_of_range {
         // When `hi` rounded up to 2^k, `as` saturates it to the true maximum.
-        Some(OutOfRangeMode::Clamp) => Ok(if val < lo { lo } else { hi }.cast_into()),
-        Some(OutOfRangeMode::Wrap) => Ok(wrap_integral_f64(to_f64_lossy(val), lo < Src::zero())),
-        None => Err(CastError::OutOfRange {
-            value: to_f64_lossy(val),
-            lo: to_f64_lossy(lo),
-            hi: to_f64_lossy(hi),
-        }),
+        Some(OutOfRangeMode::Clamp) => Ok(if rounded < lo { lo } else { hi }.cast_into()),
+        Some(OutOfRangeMode::Wrap) => Ok(wrap_integral_f64(to_f64_lossy(rounded))),
+        None => {
+            let (lo, hi) = int_bounds::<Dst>();
+            Err(CastError::OutOfRange {
+                value: to_f64_lossy(val),
+                lo,
+                hi,
+            })
+        }
     }
 }
 
@@ -464,10 +498,13 @@ where
         }
         None => {
             if val < lo || val > hi {
+                // `lo`/`hi` above are clipped to the source range; report the
+                // target type's own bounds.
+                let (dst_lo, dst_hi) = int_bounds::<Dst>();
                 Err(CastError::OutOfRange {
                     value: to_f64_lossy(val),
-                    lo: to_f64_lossy(lo),
-                    hi: to_f64_lossy(hi),
+                    lo: dst_lo,
+                    hi: dst_hi,
                 })
             } else {
                 Ok(val.cast_into())
@@ -654,6 +691,11 @@ where
 /// When the configuration allows it (empty scalar_map, clamp mode,
 /// rounding mode other than NearestAway), uses SIMD-accelerated kernels
 /// for supported type pairs (f64→u8, f64→i32, f32→u8).
+///
+/// # Errors
+///
+/// Returns `CastError::LengthMismatch` if `src` and `dst` differ in length
+/// (checked before anything is written), or the first element's error.
 pub fn convert_slice_float_to_int<Src, Dst>(
     src: &[Src],
     dst: &mut [Dst],
@@ -663,6 +705,12 @@ where
     Src: CastFloat + CastInto<Dst> + 'static,
     Dst: CastInt + 'static,
 {
+    if src.len() != dst.len() {
+        return Err(CastError::LengthMismatch {
+            src_len: src.len(),
+            dst_len: dst.len(),
+        });
+    }
     // SIMD fast path: empty scalar_map + clamp + supported rounding mode.
     // Uses TypeId to dispatch to concrete SIMD kernels at runtime.
     // The `'static` bound is satisfied by all primitive numeric types.
@@ -737,6 +785,11 @@ where
 }
 
 /// Convert a slice of integer values to integer values. Returns early on first error.
+///
+/// # Errors
+///
+/// Returns `CastError::LengthMismatch` if `src` and `dst` differ in length
+/// (checked before anything is written), or the first element's error.
 pub fn convert_slice_int_to_int<Src, Dst>(
     src: &[Src],
     dst: &mut [Dst],
@@ -746,6 +799,12 @@ where
     Src: CastInt + CastInto<Dst>,
     Dst: CastInt,
 {
+    if src.len() != dst.len() {
+        return Err(CastError::LengthMismatch {
+            src_len: src.len(),
+            dst_len: dst.len(),
+        });
+    }
     for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
         *out_slot = convert_int_to_int(*in_val, config)?;
     }
@@ -756,6 +815,11 @@ where
 ///
 /// When the configuration allows it (empty scalar_map, nearest-even rounding),
 /// uses SIMD-accelerated kernels for supported type pairs (f64->f32).
+///
+/// # Errors
+///
+/// Returns `CastError::LengthMismatch` if `src` and `dst` differ in length
+/// (checked before anything is written), or the first element's error.
 pub fn convert_slice_float_to_float<Src, Dst>(
     src: &[Src],
     dst: &mut [Dst],
@@ -765,6 +829,12 @@ where
     Src: CastFloat + CastInto<Dst> + 'static,
     Dst: CastFloat + 'static,
 {
+    if src.len() != dst.len() {
+        return Err(CastError::LengthMismatch {
+            src_len: src.len(),
+            dst_len: dst.len(),
+        });
+    }
     // SIMD fast path: empty scalar_map + nearest-even rounding + f64→f32.
     if config.map_entries.is_empty() && config.rounding == RoundingMode::NearestEven {
         use std::any::TypeId;
@@ -791,6 +861,11 @@ where
 }
 
 /// Convert a slice of integer values to float values. Returns early on first error.
+///
+/// # Errors
+///
+/// Returns `CastError::LengthMismatch` if `src` and `dst` differ in length
+/// (checked before anything is written), or the first element's error.
 pub fn convert_slice_int_to_float<Src, Dst>(
     src: &[Src],
     dst: &mut [Dst],
@@ -800,6 +875,12 @@ where
     Src: CastInt + CastInto<Dst>,
     Dst: CastFloat,
 {
+    if src.len() != dst.len() {
+        return Err(CastError::LengthMismatch {
+            src_len: src.len(),
+            dst_len: dst.len(),
+        });
+    }
     for (in_val, out_slot) in src.iter().zip(dst.iter_mut()) {
         *out_slot = convert_int_to_float(*in_val, config)?;
     }
@@ -849,8 +930,6 @@ macro_rules! impl_cast_float {
                         RoundingMode::NearestAway => <$ty>::round(self),
                     }
                 }
-                #[inline]
-                fn rem_euclid(self, rhs: Self) -> Self { <$ty>::rem_euclid(self, rhs) }
                 #[inline]
                 fn next_up(self) -> Self { <$ty>::next_up(self) }
                 #[inline]
@@ -1015,10 +1094,6 @@ mod float16_impls {
         #[inline]
         fn round_with_mode(self, mode: RoundingMode) -> Self {
             f16::from_f32(self.to_f32().round_with_mode(mode))
-        }
-        #[inline]
-        fn rem_euclid(self, rhs: Self) -> Self {
-            f16::from_f32(self.to_f32().rem_euclid(rhs.to_f32()))
         }
         #[inline]
         fn next_up(self) -> Self {
@@ -1310,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_inf_to_int_wrap_errors() {
-        // With wrap, Inf is rejected (rem_euclid(Inf) is NaN)
+        // With wrap, Inf is rejected: integers cannot represent it
         let c = f2i_cfg::<f64, i8>(
             vec![],
             RoundingMode::NearestEven,
@@ -1920,7 +1995,7 @@ mod tests {
         for mode in [TowardsZero, TowardsNegative, NearestAway, TowardsPositive] {
             assert!(matches!(
                 f2f::<f64, f32>(1e39, mode, None),
-                Err(CastError::OutOfRange { .. })
+                Err(CastError::FloatOutOfRange { .. })
             ));
         }
         assert!(matches!(
@@ -1929,8 +2004,171 @@ mod tests {
                 TowardsZero,
                 Some(OutOfRangeMode::Wrap)
             ),
-            Err(CastError::OutOfRange { .. })
+            Err(CastError::FloatOutOfRange { .. })
         ));
+    }
+
+    /// Out-of-range errors report the original input and the target type's
+    /// exact bounds, even where the bound is not representable in the source.
+    #[test]
+    fn test_out_of_range_error_reports_exact_bounds() {
+        use RoundingMode::{NearestEven, TowardsNegative};
+        let err = f2i::<f32, i32>(2_147_483_648.0, NearestEven, None).unwrap_err();
+        assert!(matches!(
+            err,
+            CastError::OutOfRange { value, lo, hi }
+                if value == 2_147_483_648.0
+                    && lo == i128::from(i32::MIN)
+                    && hi == i128::from(i32::MAX)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "Value 2147483648 out of range [-2147483648, 2147483647]. \
+             Set out_of_range='clamp' or out_of_range='wrap' to handle this."
+        );
+        // The unrounded input is reported.
+        let err = f2i::<f64, u8>(-0.25, TowardsNegative, None).unwrap_err();
+        assert!(matches!(err, CastError::OutOfRange { value, lo: 0, hi: 255 } if value == -0.25));
+        let err = f2i::<f64, u64>(TWO_POW_64, NearestEven, None).unwrap_err();
+        assert!(matches!(err, CastError::OutOfRange { hi, .. } if hi == i128::from(u64::MAX)));
+        // Int→int reports the target's bounds, not the source-clipped ones.
+        let c = i2i_cfg::<u8, i8>(vec![], None);
+        let err = convert_int_to_int(200_u8, &c).unwrap_err();
+        assert!(matches!(
+            err,
+            CastError::OutOfRange {
+                lo: -128,
+                hi: 127,
+                ..
+            }
+        ));
+    }
+
+    /// Every slice function rejects mismatched lengths before writing,
+    /// including configurations that take a SIMD fast path.
+    #[test]
+    fn test_slice_length_mismatch_errors() {
+        let is_mismatch = |r: Result<(), CastError>, src_len: usize, dst_len: usize| {
+            matches!(r, Err(CastError::LengthMismatch { src_len: s, dst_len: d })
+                if s == src_len && d == dst_len)
+        };
+        let src_f64 = [7.0_f64; 16];
+        let src_i32 = [7_i32; 16];
+        for dst_len in [0, 4, 17] {
+            let mut dst_u8 = vec![0_u8; dst_len];
+            let mut dst_i32 = vec![0_i32; dst_len];
+            let mut dst_f32 = vec![0_f32; dst_len];
+            let clamp = f2i_cfg::<f64, u8>(
+                vec![],
+                RoundingMode::NearestEven,
+                Some(OutOfRangeMode::Clamp),
+            );
+            let check = f2i_cfg::<f64, i32>(vec![], RoundingMode::NearestEven, None);
+            let f2f_cfg = FloatToFloatConfig::<f64, f32> {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: None,
+            };
+            let i2f_cfg = IntToFloatConfig::<i32, f32> {
+                map_entries: vec![],
+                rounding: RoundingMode::NearestEven,
+                out_of_range: None,
+            };
+            let i2i = i2i_cfg::<i32, u8>(vec![], Some(OutOfRangeMode::Wrap));
+            assert!(is_mismatch(
+                convert_slice_float_to_int(&src_f64, &mut dst_u8, &clamp),
+                16,
+                dst_len
+            ));
+            assert!(is_mismatch(
+                convert_slice_float_to_int(&src_f64, &mut dst_i32, &check),
+                16,
+                dst_len
+            ));
+            assert!(is_mismatch(
+                convert_slice_float_to_float(&src_f64, &mut dst_f32, &f2f_cfg),
+                16,
+                dst_len
+            ));
+            assert!(is_mismatch(
+                convert_slice_int_to_float(&src_i32, &mut dst_f32, &i2f_cfg),
+                16,
+                dst_len
+            ));
+            assert!(is_mismatch(
+                convert_slice_int_to_int(&src_i32, &mut dst_u8, &i2i),
+                16,
+                dst_len
+            ));
+            // Nothing was written.
+            assert!(dst_u8.iter().all(|&v| v == 0) && dst_f32.iter().all(|&v| v == 0.0));
+        }
+    }
+
+    /// The slice API (SIMD fast paths) returns the same values and the same
+    /// first error as converting element by element, for every mode a fast
+    /// path accepts. Lengths cover vector bodies and scalar tails.
+    #[test]
+    fn test_slice_matches_per_element() {
+        use OutOfRangeMode::Clamp;
+        use RoundingMode::*;
+        let specials = [
+            0.5,
+            1.5,
+            2.5,
+            -0.5,
+            -2.5,
+            254.5,
+            255.5,
+            -0.0,
+            3e9,
+            -3e9,
+            2_147_483_647.5,
+            -2_147_483_648.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            7.0,
+        ];
+        // The slice result, `Ok(values)` or the first error, must equal the
+        // per-element one exactly (compared via Debug, since CastError has no
+        // PartialEq).
+        fn assert_matches<S, D>(src: &[S], rounding: RoundingMode, oor: Option<OutOfRangeMode>)
+        where
+            S: CastFloat + CastInto<D> + 'static,
+            D: CastInt + 'static,
+        {
+            let cfg = f2i_cfg::<S, D>(vec![], rounding, oor);
+            let mut dst = vec![D::from_u8(0).expect("0 fits every integer type"); src.len()];
+            let slice = convert_slice_float_to_int(src, &mut dst, &cfg).map(|()| dst);
+            let expected: Result<Vec<D>, _> =
+                src.iter().map(|&v| convert_float_to_int(v, &cfg)).collect();
+            assert_eq!(
+                format!("{slice:?}"),
+                format!("{expected:?}"),
+                "{src:?} {rounding:?} {oor:?}"
+            );
+        }
+        // Stride 1 places each special next to its neighbour (e.g. an
+        // out-of-range value just before ±Inf); stride 7 mixes them.
+        for len in 1..=35 {
+            for start in 0..specials.len() {
+                for stride in [1, 7] {
+                    let src: Vec<f64> = (0..len)
+                        .map(|i| specials[(start + i * stride) % specials.len()])
+                        .collect();
+                    let src_f32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+                    for rounding in [NearestEven, TowardsZero, TowardsPositive, TowardsNegative] {
+                        for oor in [None, Some(Clamp)] {
+                            assert_matches::<f64, i32>(&src, rounding, oor);
+                            assert_matches::<f64, u8>(&src, rounding, oor);
+                            assert_matches::<f32, u8>(&src_f32, rounding, oor);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- float16 tests ----
@@ -2105,7 +2343,7 @@ mod tests {
             for mode in [RoundingMode::NearestEven, RoundingMode::TowardsZero] {
                 assert!(matches!(
                     i2f::<i32, f16>(70_000, mode, None),
-                    Err(CastError::OutOfRange { .. })
+                    Err(CastError::FloatOutOfRange { .. })
                 ));
             }
         }

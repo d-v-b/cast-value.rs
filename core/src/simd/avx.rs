@@ -240,7 +240,7 @@ pub(super) unsafe fn f64_to_f32_nearest(
     if error_on_overflow {
         for i in 0..n {
             if src[i].is_finite() && dst[i].is_infinite() {
-                return Err(crate::CastError::OutOfRange {
+                return Err(crate::CastError::FloatOutOfRange {
                     value: src[i],
                     lo: f32::MIN as f64,
                     hi: f32::MAX as f64,
@@ -272,40 +272,19 @@ pub(super) unsafe fn f64_to_i32_check(
 
     for i in (0..simd_len).step_by(4) {
         let v = _mm256_loadu_pd(src.as_ptr().add(i));
-
-        // NaN/Inf check (`x - x` is NaN exactly when x is NaN or ±Inf)
-        let nan_mask = _mm256_cmp_pd(_mm256_sub_pd(v, v), _mm256_setzero_pd(), _CMP_UNORD_Q);
-        if _mm256_movemask_pd(nan_mask) != 0 {
-            for &val in &src[i..std::cmp::min(i + 4, n)] {
-                if !val.is_finite() {
-                    return Err(crate::CastError::NanOrInf { value: val });
-                }
-            }
-        }
-
         let r = round_f64_avx(v, round_mode);
 
-        // Range check
+        // `x - x` is NaN exactly when x is NaN or ±Inf; NaN also fails both
+        // range comparisons, so it needs this separate mask.
+        let non_finite = _mm256_cmp_pd(_mm256_sub_pd(v, v), _mm256_setzero_pd(), _CMP_UNORD_Q);
         let below = _mm256_cmp_pd(r, lo, _CMP_LT_OQ);
         let above = _mm256_cmp_pd(r, hi, _CMP_GT_OQ);
-        let out_of_range = _mm256_or_pd(below, above);
-        if _mm256_movemask_pd(out_of_range) != 0 {
-            for &val in &src[i..std::cmp::min(i + 4, n)] {
-                let rounded = match rounding {
-                    RoundingMode::NearestEven => val.round_ties_even(),
-                    RoundingMode::TowardsZero => val.trunc(),
-                    RoundingMode::TowardsPositive => val.ceil(),
-                    RoundingMode::TowardsNegative => val.floor(),
-                    RoundingMode::NearestAway => unreachable!(),
-                };
-                if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
-                    return Err(crate::CastError::OutOfRange {
-                        value: val,
-                        lo: i32::MIN as f64,
-                        hi: i32::MAX as f64,
-                    });
-                }
-            }
+        let invalid = _mm256_or_pd(non_finite, _mm256_or_pd(below, above));
+        if _mm256_movemask_pd(invalid) != 0 {
+            // A NaN/Inf or out-of-range lane: finish on the scalar path, which
+            // reports the first error in element order, exactly as the
+            // non-SIMD path does.
+            return super::f64_to_i32_check_scalar(&src[i..], &mut dst[i..], rounding);
         }
 
         let converted = _mm256_cvtpd_epi32(r);
@@ -313,29 +292,7 @@ pub(super) unsafe fn f64_to_i32_check(
     }
 
     // Scalar tail
-    for i in simd_len..n {
-        let val = src[i];
-        if !val.is_finite() {
-            return Err(crate::CastError::NanOrInf { value: val });
-        }
-        let rounded = match rounding {
-            RoundingMode::NearestEven => val.round_ties_even(),
-            RoundingMode::TowardsZero => val.trunc(),
-            RoundingMode::TowardsPositive => val.ceil(),
-            RoundingMode::TowardsNegative => val.floor(),
-            RoundingMode::NearestAway => unreachable!(),
-        };
-        if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
-            return Err(crate::CastError::OutOfRange {
-                value: val,
-                lo: i32::MIN as f64,
-                hi: i32::MAX as f64,
-            });
-        }
-        dst[i] = rounded as i32;
-    }
-
-    Ok(())
+    super::f64_to_i32_check_scalar(&src[simd_len..], &mut dst[simd_len..], rounding)
 }
 
 // ---------------------------------------------------------------------------

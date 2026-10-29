@@ -47,9 +47,9 @@ Each conversion path has its own config struct:
 | `RoundingMode` | Enum: `NearestEven`, `TowardsZero`, `TowardsPositive`, `TowardsNegative`, `NearestAway` |
 | `OutOfRangeMode` | Enum: `Clamp`, `Wrap` |
 | `MapEntry<Src, Dst>` | A scalar map entry with typed source and target fields |
-| `CastError` | Error type for conversion failures |
+| `CastError` | Error type: `NanOrInf`, `OutOfRange` (integer targets), `FloatOutOfRange` (float targets), `LengthMismatch` |
 | `CastNum` | Base trait for all numeric types |
-| `CastInt` | Marker trait for integer types |
+| `CastInt` | Trait for integer types (`FromPrimitive` builds wrapped values) |
 | `CastFloat` | Trait for float types with rounding and IEEE 754 operations |
 | `CastInto<Dst>` | Conversion trait with range bounds and cast operation |
 
