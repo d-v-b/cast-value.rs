@@ -235,6 +235,8 @@ pub struct IntToFloatConfig<Src, Dst> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// 2^53: every integer below this magnitude is exact in `f64`.
+const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
 /// 2^63 and 2^64: the `i64`/`u64` domain limits, exact in `f64`.
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
@@ -729,17 +731,20 @@ where
     }
 
     // Step 2: round. Rust's `as` rounds integers to the nearest float, ties to
-    // even, and is exact (so right in every mode) when the bits from the
-    // highest to the lowest set bit fit in the target's significand. Only the
-    // remaining values are rounded on the integer's bits.
+    // even, and is exact (so right in every mode) when it equals the integer.
+    // Comparing in f64 decides that exactly while the f64 value is below 2^53
+    // (an integer that rounded to 2^53 itself may not be), where f64 holds the
+    // integer exactly (always, for sources of at most 53 bits);
+    // anything else is rounded on the integer's bits.
     let nearest = val.cast_into();
-    let (magnitude, negative) = int_magnitude(val);
-    let digits = mantissa_digits::<Dst>();
-    let significant_span =
-        (u64::BITS - magnitude.leading_zeros()).saturating_sub(magnitude.trailing_zeros());
-    let result = if rounding == RoundingMode::NearestEven || significant_span <= digits {
+    let val_f64 = to_f64_lossy(val);
+    let known_exact = val_f64 == to_f64_lossy(nearest)
+        && (int_width::<Src>().0 <= f64::MANTISSA_DIGITS || val_f64.abs() < TWO_POW_53);
+    let result = if rounding == RoundingMode::NearestEven || known_exact {
         nearest
     } else {
+        let (magnitude, negative) = int_magnitude(val);
+        let digits = mantissa_digits::<Dst>();
         let rounded = round_int_to_precision(magnitude, negative, digits, rounding);
         if rounded.abs() > to_f64_lossy(Dst::max_value()) {
             Dst::infinity() // overflow marker, handled below
@@ -754,7 +759,6 @@ where
     // Only targets whose finite range ends below 2^64 (f16) can overflow; the
     // range test is a constant, so wide targets skip the check entirely.
     if to_f64_lossy(Dst::max_value()) < TWO_POW_64 && result.is_infinite() {
-        let val_f64 = to_f64_lossy(val);
         return float_overflow(val_f64 < 0.0, val_f64, config.out_of_range);
     }
     Ok(result)
