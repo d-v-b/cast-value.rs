@@ -23,10 +23,12 @@ jobs:
             target: x86_64
           - runner: ubuntu-22.04
             target: x86
+            interpreter: python3.11 python3.12 python3.13 python3.14 python3.15 python3.15t pypy3.11 pypy3.12
           - runner: ubuntu-22.04
             target: aarch64
           - runner: ubuntu-22.04
             target: armv7
+            interpreter: python3.11 python3.12 python3.13 python3.14 python3.15 python3.15t pypy3.11 pypy3.12
           - runner: ubuntu-22.04
             target: s390x
           - runner: ubuntu-22.04
@@ -38,11 +40,14 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: 3.x
+      # rust-numpy refuses to compile for free-threaded Python on 32-bit
+      # targets before 3.15, so those targets list their interpreters instead
+      # of finding them all.
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist ${{ matrix.platform.interpreter && format('--interpreter {0}', matrix.platform.interpreter) || '--find-interpreter' }}
           manylinux: auto
           working-directory: python
       - name: Upload wheels
@@ -60,10 +65,12 @@ jobs:
             target: x86_64
           - runner: ubuntu-22.04
             target: x86
+            interpreter: python3.11 python3.12 python3.13 python3.14 python3.15 python3.15t pypy3.11 pypy3.12
           - runner: ubuntu-22.04
             target: aarch64
           - runner: ubuntu-22.04
             target: armv7
+            interpreter: python3.11 python3.12 python3.13 python3.14 python3.15 python3.15t pypy3.11 pypy3.12
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -71,11 +78,14 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: 3.x
+      # rust-numpy refuses to compile for free-threaded Python on 32-bit
+      # targets before 3.15, so those targets list their interpreters instead
+      # of finding them all.
       - name: Build wheels
         uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist ${{ matrix.platform.interpreter && format('--interpreter {0}', matrix.platform.interpreter) || '--find-interpreter' }}
           manylinux: musllinux_1_2
           working-directory: python
       - name: Upload wheels
